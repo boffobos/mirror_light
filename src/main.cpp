@@ -9,21 +9,21 @@ typedef struct
 {
   // Light can be turned on or off (1 or 0 respectively)
   uint8_t light_state;
-  // Light mode can be cold white, warm white and mixed lamp turned on ("0", "1", "2" respectively)
-  char light_mode;
+  // Light mode can be cold white, warm white and mixed lamp turned on (1, 2, 3 respectively - like a byte [10000000], [01000000], [11000000])
+  uint8_t light_mode;
 } M_STATE;
 
 typedef struct
 {
   uint8_t pin;        // button pin on arduino
-  char type;          // 'L' - self locked (maintened)  button type, 'M' - momentary button type
+  char type;          // 'L' - self locked (maintained)  button type, 'M' - momentary button type
   uint8_t front;      // 0 if pushed button connects to GND, 1 if connect to VCC
   uint8_t state;      // current_time state of button: 0 - off state, 1 - on state
   uint8_t prev_state; // previous state of button: 0 - off state, 1 - on state
   uint8_t is_defined; // levels of definition: 0 - not defined, 3 - well defined
 } BUTTON;
 
-M_STATE light;
+M_STATE light = {0, 3};
 BUTTON b1 = {
     12,
     127,
@@ -40,11 +40,12 @@ int digitalReadDebounce(int pin);
 int handle_press_button(BUTTON *btn);
 void load_m_state(M_STATE *id);
 void load_button(BUTTON *btn, uint8_t btn_number);
+void handle_light(M_STATE *light);
+void change_light_mode(unsigned long t1, unsigned long t2, M_STATE *light);
 
 void setup()
 {
   // put your setup code here, to run once:
-  // int result = myFunction(2, 3);
   pinMode(REL_1, OUTPUT);
   pinMode(REL_2, OUTPUT);
   pinMode(b1.pin, INPUT_PULLUP);
@@ -58,23 +59,16 @@ void setup()
 void loop()
 {
   // put your main code here, to run repeatedly:
+
   uint8_t btn_state = handle_press_button(&b1);
   if (btn_state != prev_btn_state)
   {
-    if (millis() - last_changed_btn_state_time < SET_INTERVAL_S * 1000)
-    {
-      if (rel_state + 1 > 2)
-      {
-        rel_state = 0;
-      }
-      else
-      {
-        rel_state += 1;
-      }
-    }
+    change_light_mode(last_changed_btn_state_time, millis(), &light);
     last_changed_btn_state_time = millis();
     prev_btn_state = btn_state;
   }
+
+  // debug messages
   if (millis() % 200 == 0)
   {
     Serial.print("State: ");
@@ -84,29 +78,15 @@ void loop()
     Serial.print("\tFront: ");
     Serial.println(b1.front);
   }
-
-  if (btn_state == 0)
+  if (b1.state)
   {
-    if (rel_state == 0)
-    {
-      digitalWrite(REL_1, LOW);
-      digitalWrite(REL_2, LOW);
-    }
-    else if (rel_state == 1)
-    {
-      digitalWrite(REL_1, LOW);
-      digitalWrite(REL_2, HIGH);
-    }
-    else if (rel_state == 2)
-    {
-      digitalWrite(REL_1, HIGH);
-      digitalWrite(REL_2, LOW);
-    }
+    light.light_state = 1;
+    handle_light(&light);
   }
   else
   {
-    digitalWrite(REL_1, HIGH);
-    digitalWrite(REL_2, HIGH);
+    light.light_state = 0;
+    handle_light(&light);
   }
 }
 
@@ -120,9 +100,10 @@ int handle_press_button(BUTTON *btn)
   unsigned long current_time = millis();
   unsigned long signal_changed_time = 0;
   int btn_prev_state = current_signal_state;
-
+  // on the first power on this cycle should recognize button type: e.g. maintained or momentary, high or low level
   while (!btn->is_defined)
   {
+    // need insert periodicaly changing pinMode between INPUT and INPUT_PULLUP to recognize LOW and HIGH buttons
     current_signal_state = digitalReadDebounce(btn->pin);
     current_time = millis();
     if (current_signal_state != btn_prev_state)
@@ -141,6 +122,7 @@ int handle_press_button(BUTTON *btn)
         // signal_changed_time = 0;
         // btn_prev_state = current_signal_state;
         btn->prev_state = current_signal_state;
+        // Write to EEPROM button data?
       }
       else if (current_time - signal_changed_time > max_depress_time_ms)
       {
@@ -150,6 +132,7 @@ int handle_press_button(BUTTON *btn)
         btn->state = 0;
         // signal_changed_time = 0;
         // btn_prev_state = current_signal_state;
+        // Write to EEPROM button data?
       }
     }
   }
@@ -189,7 +172,40 @@ int digitalReadDebounce(int pin)
 
 void handle_light(M_STATE *light)
 {
-  
+  if (light->light_state == 1)
+  {
+    if (light->light_mode == 1)
+    {
+      digitalWrite(REL_1, LOW);
+      digitalWrite(REL_2, HIGH);
+    }
+    else if (light->light_mode == 2)
+    {
+      digitalWrite(REL_1, HIGH);
+      digitalWrite(REL_2, LOW);
+    }
+    else if (light->light_mode == 3)
+    {
+      digitalWrite(REL_1, LOW);
+      digitalWrite(REL_2, LOW);
+    }
+  }
+  else
+  {
+    digitalWrite(REL_1, HIGH);
+    digitalWrite(REL_2, HIGH);
+  }
+  // whire to EEPROM M_STATE ?
+}
+
+void change_light_mode(unsigned long t1, unsigned long t2, M_STATE *light)
+{
+  unsigned int pressing_interval_for_setting_ms = 500;
+  int max_light_mode = 3;
+  if (t2 - t1 <= pressing_interval_for_setting_ms)
+  {
+    light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
+  }
 }
 
 void load_m_state(M_STATE *id)
