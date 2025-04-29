@@ -3,7 +3,6 @@
 
 #define REL_1 A0
 #define REL_2 A1
-#define SET_INTERVAL_S 5
 
 typedef struct
 {
@@ -15,33 +14,37 @@ typedef struct
 
 typedef struct
 {
-  uint8_t pin;        // button pin on arduino
-  char type;          // 'L' - self locked (maintained)  button type, 'M' - momentary button type
-  uint8_t front;      // 0 if pushed button connects to GND, 1 if connect to VCC
-  uint8_t state;      // current_time state of button: 0 - off state, 1 - on state
-  uint8_t prev_state; // previous state of button: 0 - off state, 1 - on state
-  uint8_t is_defined; // levels of definition: 0 - not defined, 3 - well defined
+  uint8_t is_defined;          // levels of definition: 0 - not defined, 3 - well defined
+  uint8_t pin;                 // button pin on arduino
+  char type;                   // 'L' - self locked (maintained)  button type, 'M' - momentary button type
+  uint8_t front;               // 0 if pushed button connects to GND, 1 if connect to VCC
+  uint8_t state;               // current_time state of button: 0 - off state, 1 - on state
+  uint8_t last_pin_state;      // previous state of button: 0 - off state, 1 - on state
+  uint32_t current_state_time; // time when current state was changed to ON state
+  uint32_t last_state_time;    // last time when state was changed to ON state
 } BUTTON;
 
 M_STATE light = {0, 3};
 BUTTON b1 = {
+    0,
     12,
     127,
     255,
     255,
     255,
+    0,
     0};
-int rel_state = 0;
-int prev_btn_state;
-unsigned long last_changed_btn_state_time;
+uint8_t prev_btn_state;
+uint32_t last_changed_btn_state_time;
 
 // put function declarations here:
 int digitalReadDebounce(int pin);
+void define_new_button(BUTTON *btn);
 int handle_press_button(BUTTON *btn);
 void load_m_state(M_STATE *id);
 void load_button(BUTTON *btn, uint8_t btn_number);
 void handle_light(M_STATE *light);
-void change_light_mode(unsigned long t1, unsigned long t2, M_STATE *light);
+void change_light_mode(BUTTON *btn, M_STATE *light);
 
 void setup()
 {
@@ -51,6 +54,7 @@ void setup()
   pinMode(b1.pin, INPUT_PULLUP);
   digitalWrite(REL_1, HIGH);
   digitalWrite(REL_2, HIGH);
+  define_new_button(&b1);
   prev_btn_state = handle_press_button(&b1);
   last_changed_btn_state_time = millis();
   Serial.begin(9600);
@@ -60,23 +64,22 @@ void loop()
 {
   // put your main code here, to run repeatedly:
 
-  uint8_t btn_state = handle_press_button(&b1);
-  if (btn_state != prev_btn_state)
-  {
-    change_light_mode(last_changed_btn_state_time, millis(), &light);
-    last_changed_btn_state_time = millis();
-    prev_btn_state = btn_state;
-  }
+  handle_press_button(&b1);
+  change_light_mode(&b1, &light);
 
   // debug messages
   if (millis() % 200 == 0)
   {
     Serial.print("State: ");
     Serial.print(b1.state);
-    Serial.print("\tType: ");
+    Serial.print(" Type: ");
     Serial.print(b1.type);
-    Serial.print("\tFront: ");
-    Serial.println(b1.front);
+    Serial.print(" Cur_st_time: ");
+    Serial.print(b1.current_state_time / 1000);
+    Serial.print(" Lst_st_time: ");
+    Serial.print(b1.last_state_time / 1000);
+    Serial.print("\tLight_mode: ");
+    Serial.println(light.light_mode);
   }
   if (b1.state)
   {
@@ -91,16 +94,14 @@ void loop()
 }
 
 // put function definitions here:
-
-int handle_press_button(BUTTON *btn)
+void define_new_button(BUTTON *btn)
 {
-  unsigned long min_depress_time_ms = 100; // time need to depress and release momentary button
-  unsigned long max_depress_time_ms = min_depress_time_ms * 3;
+  // on the first power on this function should recognize button type: e.g. maintained or momentary, high or low level
+  unsigned long max_depress_time_ms = 300; // time need to depress and release momentary button
   int current_signal_state = digitalReadDebounce(btn->pin);
   unsigned long current_time = millis();
   unsigned long signal_changed_time = 0;
   int btn_prev_state = current_signal_state;
-  // on the first power on this cycle should recognize button type: e.g. maintained or momentary, high or low level
   while (!btn->is_defined)
   {
     // need insert periodicaly changing pinMode between INPUT and INPUT_PULLUP to recognize LOW and HIGH buttons
@@ -119,9 +120,7 @@ int handle_press_button(BUTTON *btn)
         btn->front = btn_prev_state;
         btn->is_defined = 1;
         btn->state = 0;
-        // signal_changed_time = 0;
-        // btn_prev_state = current_signal_state;
-        btn->prev_state = current_signal_state;
+        btn->last_pin_state = current_signal_state;
         // Write to EEPROM button data?
       }
       else if (current_time - signal_changed_time > max_depress_time_ms)
@@ -130,24 +129,49 @@ int handle_press_button(BUTTON *btn)
         btn->front = btn_prev_state;
         btn->is_defined = 1;
         btn->state = 0;
-        // signal_changed_time = 0;
-        // btn_prev_state = current_signal_state;
         // Write to EEPROM button data?
       }
     }
   }
+}
+
+int handle_press_button(BUTTON *btn)
+{
+  // this function handle presses on buttons and write this data to button struct
+  int current_signal_state = digitalReadDebounce(btn->pin);
+  unsigned long current_time = millis();
 
   if (btn->type == 'L')
   {
-    btn->state = current_signal_state == btn->front ? 1 : 0;
+    if (current_signal_state == btn->front)
+    {
+      btn->state = 1;
+      btn->last_state_time = btn->current_state_time;
+      btn->current_state_time = current_time;
+    }
+    else
+    {
+      btn->state = 0;
+      btn->last_state_time = btn->current_state_time;
+      btn->current_state_time = current_time;
+    }
   }
   else if (btn->type == 'M')
   {
-    if (current_signal_state != btn->prev_state)
+    if (current_signal_state != btn->last_pin_state)
     {
-      btn->state = current_signal_state == btn->front ? btn->state : !btn->state;
+      if (current_signal_state == btn->front)
+      {
+        btn->state = btn->state;
+      }
+      else
+      {
+        btn->state = !btn->state;
+        btn->last_state_time = btn->current_state_time;
+        btn->current_state_time = current_time;
+      }
     }
-    btn->prev_state = current_signal_state;
+    btn->last_pin_state = current_signal_state;
   }
 
   return btn->state;
@@ -198,11 +222,13 @@ void handle_light(M_STATE *light)
   // whire to EEPROM M_STATE ?
 }
 
-void change_light_mode(unsigned long t1, unsigned long t2, M_STATE *light)
+void change_light_mode(BUTTON *btn, M_STATE *light)
 {
-  unsigned int pressing_interval_for_setting_ms = 500;
-  int max_light_mode = 3;
-  if (t2 - t1 <= pressing_interval_for_setting_ms)
+  unsigned int pressing_interval_for_setting_ms = 1000;
+  int max_light_mode = 3; // it can be retrive from count of relays if they control same group of devices. For future development
+  uint32_t t2 = millis();
+  uint32_t t1 = btn->last_state_time;
+  if (t2 - t1 <= pressing_interval_for_setting_ms && btn->state == 1)
   {
     light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
   }
@@ -229,13 +255,4 @@ void load_button(BUTTON *btn, uint8_t btn_number)
   int address = sizeof(M_STATE) + sizeof(BUTTON) * (btn_number - 1);
   EEPROM.get(address, *btn);
   // check if loaded values is in valid range and handle invalid values
-}
-
-void print_btn_state(uint8_t state)
-{
-  uint8_t term_width = 63;
-
-  for (int i = 0; i <= term_width; i++)
-  {
-  }
 }
