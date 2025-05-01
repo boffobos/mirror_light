@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 
+#define member_size(type, member) (sizeof(((type *)0)->member))
 #define REL_1 A0
 #define REL_2 A1
 
@@ -41,10 +42,9 @@ BUTTON b1 = {
 int digitalReadDebounce(int pin);
 void define_new_button(BUTTON *btn);
 int handle_press_button(BUTTON *btn);
-void save_m_state(M_STATE *id);
-void load_m_state(M_STATE *id);
-void load_button(BUTTON *btn, uint8_t btn_number);
-void set_light_mode(M_STATE *light);
+void m_state_rom(M_STATE *id, char action);
+int button_state_rom(BUTTON *btn, uint8_t btn_number, char action);
+void load_button_state(BUTTON *btn, uint8_t btn_number);
 void change_light_mode(M_STATE *light, BUTTON *btn);
 void handle_switching_light(M_STATE *id, BUTTON *btn);
 
@@ -59,8 +59,13 @@ void setup()
   pinMode(b1.pin, INPUT_PULLUP);
   digitalWrite(REL_1, HIGH);
   digitalWrite(REL_2, HIGH);
-  define_new_button(&b1);
-  load_m_state(&light);
+  uint8_t is_loaded = button_state_rom(&b1, 1, 'L');
+  if (!is_loaded)
+  {
+    define_new_button(&b1);
+    button_state_rom(&b1, 1, 'S');
+  }
+  m_state_rom(&light, 'L');
 }
 
 void loop()
@@ -72,17 +77,17 @@ void loop()
   handle_switching_light(&light, &b1);
 
   // debug messages
-  if (millis() % 100 == 0)
-  {
-    Serial.print("State: ");
-    Serial.print(b1.state);
-    Serial.print(" Last state: ");
-    Serial.print(b1.last_state);
-    Serial.print(" Light_state: ");
-    Serial.print(light.light_state / 1000);
-    Serial.print(" Light_mode: ");
-    Serial.println(light.light_mode);
-  }
+  // if (millis() % 100 == 0)
+  // {
+  //   Serial.print("State: ");
+  //   Serial.print(b1.state);
+  //   Serial.print(" Last state: ");
+  //   Serial.print(b1.last_state);
+  //   Serial.print(" Light_state: ");
+  //   Serial.print(light.light_state / 1000);
+  //   Serial.print(" Light_mode: ");
+  //   Serial.println(light.light_mode);
+  // }
 }
 // put function definitions here:
 void define_new_button(BUTTON *btn)
@@ -165,7 +170,7 @@ int handle_press_button(BUTTON *btn)
 
 void handle_switching_light(M_STATE *id, BUTTON *btn)
 {
-  // if button has not been swiched last time skeep
+  // if button has not been swiched last time skip
   static uint8_t last_btn_state;
   if (btn->state == last_btn_state)
   {
@@ -226,33 +231,6 @@ int digitalReadDebounce(int pin)
   return pin_state_accumulator / counter;
 }
 
-// void set_light_mode(M_STATE *light)
-// {
-//   if (light->light_state == 0)
-//   {
-//     digitalWrite(REL_1, HIGH);
-//     digitalWrite(REL_2, HIGH);
-//     return;
-//   }
-
-//   if (light->light_mode == 1)
-//   {
-//     digitalWrite(REL_1, LOW);
-//     digitalWrite(REL_2, HIGH);
-//   }
-//   else if (light->light_mode == 2)
-//   {
-//     digitalWrite(REL_1, HIGH);
-//     digitalWrite(REL_2, LOW);
-//   }
-//   else if (light->light_mode == 3)
-//   {
-//     digitalWrite(REL_1, LOW);
-//     digitalWrite(REL_2, LOW);
-//   }
-//   return;
-// }
-
 void change_light_mode(M_STATE *light, BUTTON *btn)
 {
   unsigned int double_click_interval_ms = 200;
@@ -260,7 +238,7 @@ void change_light_mode(M_STATE *light, BUTTON *btn)
   uint32_t t2 = btn->current_state_time;
   uint32_t t1 = btn->last_state_time;
   static uint8_t last_btn_state;
-  if (btn->state == last_btn_state)
+  if (btn->state == last_btn_state || t1 == 0)
   {
     last_btn_state = btn->state;
     return;
@@ -268,35 +246,96 @@ void change_light_mode(M_STATE *light, BUTTON *btn)
   if (t2 - t1 <= double_click_interval_ms)
   {
     light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
-    // save_m_state(light);
+    m_state_rom(light, 'S');
   }
   last_btn_state = btn->state;
   return;
 }
 
-void save_m_state(M_STATE *id)
+void m_state_rom(M_STATE *id, char action)
 {
-  int address_state = 0;
-  int address_mode = address_state + sizeof(id->light_state);
-  uint8_t first_byte = EEPROM.put(address_state, id->light_state);
-  uint8_t second_byte = EEPROM.put(address_mode, id->light_mode);
-  Serial.println(first_byte);
-  Serial.println(second_byte);
+  int address_offset_state = 0;
+  int address_offset_mode = address_offset_state + sizeof(id->light_state);
+  if (action == 'S')
+  {
+    uint8_t first_byte = EEPROM.put(address_offset_state, id->light_state);
+    uint8_t second_byte = EEPROM.put(address_offset_mode, id->light_mode);
+    Serial.println(first_byte);
+    Serial.println(second_byte);
+  }
+  else if (action == 'L')
+  {
+    uint8_t first_byte = EEPROM.get(address_offset_state, id->light_state);
+    uint8_t second_byte = EEPROM.get(address_offset_mode, id->light_mode);
+    Serial.println(first_byte);
+    Serial.println(second_byte);
+  }
   return;
 }
 
-void load_m_state(M_STATE *id)
+int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
 {
-  int address_1 = 0;
-  int address_2 = address_1 + sizeof(id->light_state);
-  uint8_t first_byte = EEPROM.get(address_1, id->light_state);
-  uint8_t second_byte = EEPROM.get(address_2, id->light_mode);
-  Serial.println(first_byte);
-  Serial.println(second_byte);
-  return;
+  // Function save or load button state from EEPROM. action has 2 options: 'S' - save, 'L' - load
+  // memory size occupied by M_STATE properties saved in EEPROM
+  uint8_t m_state_address_offset = member_size(M_STATE, light_state) + member_size(M_STATE, light_mode);
+  // memory size occupied by BUTTON properties saved in EEPROM
+  uint8_t button_address_offset = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
+  // address offset depending of number of button
+  uint8_t address_offset = m_state_address_offset + button_address_offset * (btn_number - 1);
+  uint8_t pin_offset = address_offset + sizeof(btn->pin);
+  uint8_t type_offset = pin_offset + sizeof(btn->type);
+  BUTTON backup = *btn;
+  if (action == 'S')
+  {
+    Serial.print("Saving....");
+    if (!btn->is_defined)
+    {
+      return 0;
+    }
+
+    if (btn->pin != EEPROM.put(address_offset, btn->pin))
+    {
+      return 0;
+    }
+    if (btn->type != EEPROM.put(pin_offset, btn->type))
+    {
+      return 0;
+    }
+    if (btn->front != EEPROM.put(type_offset, btn->front))
+    {
+      return 0;
+    }
+    return 1;
+  }
+  else if (action == 'L')
+  {
+    EEPROM.get(address_offset, backup.pin);
+    EEPROM.get(pin_offset, backup.type);
+    EEPROM.get(type_offset, backup.front);
+    if (backup.pin > 13 || backup.pin < 2)
+    {
+      return 0;
+    }
+    if (backup.type != 'L' && backup.type != 'M')
+    {
+      return 0;
+    }
+    if (backup.front > 1)
+    {
+      return 0;
+    }
+    backup.state = 0;
+    backup.last_state = 0;
+    backup.last_pin_state = !backup.front;
+    backup.current_state_time = millis();
+    backup.last_state_time = 0;
+    *btn = backup;
+    return 1;
+  }
+  return 0;
 }
 
-void load_button(BUTTON *btn, uint8_t btn_number)
+void load_button_state(BUTTON *btn, uint8_t btn_number)
 {
   int address = sizeof(M_STATE) + sizeof(BUTTON) * (btn_number - 1);
   EEPROM.get(address, *btn);
