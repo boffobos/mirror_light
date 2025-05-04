@@ -1,9 +1,17 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 
+// Todo:
+// - Timeout when light should turn off automaticaly
+// Working with few buttons
+// Posibility to load pins number and working mode from external source then initialize it programmaticaly
+// Improvments:
+// in function define new button need to change periodicaly pinMode to detect pressing button with different front
+
 #define member_size(type, member) (sizeof(((type *)0)->member))
 #define REL_1 A0
 #define REL_2 A1
+#define TIMEOUT 5
 
 typedef struct
 {
@@ -44,9 +52,9 @@ void define_new_button(BUTTON *btn);
 int handle_press_button(BUTTON *btn);
 void m_state_rom(M_STATE *id, char action);
 int button_state_rom(BUTTON *btn, uint8_t btn_number, char action);
-void load_button_state(BUTTON *btn, uint8_t btn_number);
+void watching_buttons_state_changes(M_STATE *light, BUTTON *btns[], int btn_count);
 void change_light_mode(M_STATE *light, BUTTON *btn);
-void handle_switching_light(M_STATE *id, BUTTON *btn);
+void handle_switching_light(M_STATE *id);
 
 void setup()
 {
@@ -71,10 +79,12 @@ void setup()
 void loop()
 {
   // put your main code here, to run repeatedly:
-
+  BUTTON *arr[] = {&b1};
   handle_press_button(&b1);
-  change_light_mode(&light, &b1);
-  handle_switching_light(&light, &b1);
+  watching_buttons_state_changes(&light, arr, 1);
+  handle_switching_light(&light);
+  // change_light_mode(&light, &b1);
+  // handle_switching_light(&light, &b1);
 
   // debug messages
   // if (millis() % 100 == 0)
@@ -117,7 +127,6 @@ void define_new_button(BUTTON *btn)
         btn->is_defined = 1;
         btn->state = 0;
         btn->last_pin_state = current_signal_state;
-        // Write to EEPROM button data?
       }
       else if (current_time - signal_changed_time > max_depress_time_ms)
       {
@@ -125,7 +134,6 @@ void define_new_button(BUTTON *btn)
         btn->front = btn_prev_state;
         btn->is_defined = 1;
         btn->state = 0;
-        // Write to EEPROM button data?
       }
     }
   }
@@ -168,30 +176,60 @@ int handle_press_button(BUTTON *btn)
   return btn->state;
 }
 
-void handle_switching_light(M_STATE *id, BUTTON *btn)
+void watching_buttons_state_changes(M_STATE *light, BUTTON *btns[], int btn_count)
 {
-  // if button has not been swiched last time skip
-  static uint8_t last_btn_state;
-  if (btn->state == last_btn_state)
+  // This function watching for changing states of buttons and triggers nessesary functions or states in structs
+  const int max_btn_count = 10;
+  uint32_t current_time = millis();
+  struct b_state
   {
-    last_btn_state = btn->state;
-    return;
-  }
+    uint8_t b_pin;
+    uint32_t last_b_state;
+  };
 
-  if (btn->state == 0)
+  static struct b_state b_time[max_btn_count];
+
+  for (int i = 0; i < btn_count; i++)
+  {
+    uint8_t matched = 0;
+    for (int j = 0; j < btn_count; j++)
+    {
+      if (btns[i]->pin == b_time[j].b_pin)
+      {
+        if (btns[i]->state != b_time[j].last_b_state)
+        {
+          light->light_state = btns[i]->state;
+          light->timestamp = current_time;
+          change_light_mode(light, btns[i]);
+        }
+        b_time[j].last_b_state = btns[i]->state;
+        matched = 1;
+      }
+    }
+    if (!matched)
+    {
+      b_time[i].b_pin = btns[i]->pin;
+      b_time[i].last_b_state = btns[i]->state;
+    }
+    matched = 0;
+  }
+}
+
+void handle_switching_light(M_STATE *id)
+{
+
+  uint32_t current_time = millis();
+  uint32_t timeout_ms = TIMEOUT * 1000;
+  // handling timeout
+  if (current_time - id->timestamp > timeout_ms)
   {
     id->light_state = 0;
-  }
-  else if (btn->state == 1)
-  {
-    id->light_state = 1;
   }
 
   if (id->light_state == 0)
   {
     digitalWrite(REL_1, HIGH);
     digitalWrite(REL_2, HIGH);
-    last_btn_state = btn->state;
     return;
   }
 
@@ -210,7 +248,21 @@ void handle_switching_light(M_STATE *id, BUTTON *btn)
     digitalWrite(REL_1, LOW);
     digitalWrite(REL_2, LOW);
   }
-  last_btn_state = btn->state;
+  return;
+}
+
+void change_light_mode(M_STATE *light, BUTTON *btn)
+{
+  unsigned int double_click_interval_ms = 200;
+  int max_light_mode = 3; // it can be retrive from count of relays if they control same group of devices. For future development
+  uint32_t t2 = btn->current_state_time;
+  uint32_t t1 = btn->last_state_time;
+
+  if (t2 - t1 <= double_click_interval_ms && t1 != 0)
+  {
+    light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
+    m_state_rom(light, 'S');
+  }
   return;
 }
 
@@ -231,29 +283,9 @@ int digitalReadDebounce(int pin)
   return pin_state_accumulator / counter;
 }
 
-void change_light_mode(M_STATE *light, BUTTON *btn)
-{
-  unsigned int double_click_interval_ms = 200;
-  int max_light_mode = 3; // it can be retrive from count of relays if they control same group of devices. For future development
-  uint32_t t2 = btn->current_state_time;
-  uint32_t t1 = btn->last_state_time;
-  static uint8_t last_btn_state;
-  if (btn->state == last_btn_state || t1 == 0)
-  {
-    last_btn_state = btn->state;
-    return;
-  }
-  if (t2 - t1 <= double_click_interval_ms)
-  {
-    light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
-    m_state_rom(light, 'S');
-  }
-  last_btn_state = btn->state;
-  return;
-}
-
 void m_state_rom(M_STATE *id, char action)
 {
+  // Need to verify saving and loaded data
   int address_offset_state = 0;
   int address_offset_mode = address_offset_state + sizeof(id->light_state);
   if (action == 'S')
@@ -333,11 +365,4 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
     return 1;
   }
   return 0;
-}
-
-void load_button_state(BUTTON *btn, uint8_t btn_number)
-{
-  int address = sizeof(M_STATE) + sizeof(BUTTON) * (btn_number - 1);
-  EEPROM.get(address, *btn);
-  // check if loaded values is in valid range and handle invalid values
 }
