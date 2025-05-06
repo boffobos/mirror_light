@@ -45,7 +45,15 @@ BUTTON b1 = {
     255,
     0,
     0};
-
+BUTTON b2 = {
+    0,
+    11,
+    127,
+    255,
+    255,
+    255,
+    0,
+    0};
 // put function declarations here:
 int digitalReadDebounce(int pin);
 void define_new_button(BUTTON *btn);
@@ -65,13 +73,24 @@ void setup()
   pinMode(REL_1, OUTPUT);
   pinMode(REL_2, OUTPUT);
   pinMode(b1.pin, INPUT_PULLUP);
+  pinMode(b2.pin, INPUT_PULLUP);
   digitalWrite(REL_1, HIGH);
   digitalWrite(REL_2, HIGH);
-  uint8_t is_loaded = button_state_rom(&b1, 1, 'L');
-  if (!is_loaded)
+  uint8_t is_loaded1 = button_state_rom(&b1, 1, 'L');
+  uint8_t is_loaded2 = button_state_rom(&b2, 2, 'L');
+  // Serial.print("Is loaded1 ");
+  // Serial.println(is_loaded1);
+  // Serial.print("Is loaded2: ");
+  // Serial.println(is_loaded2);
+  if (!is_loaded1)
   {
     define_new_button(&b1);
     button_state_rom(&b1, 1, 'S');
+  }
+  else if (!is_loaded2)
+  {
+    define_new_button(&b2);
+    button_state_rom(&b2, 2, 'S');
   }
   m_state_rom(&light, 'L');
 }
@@ -79,22 +98,24 @@ void setup()
 void loop()
 {
   // put your main code here, to run repeatedly:
-  BUTTON *arr[] = {&b1};
+  BUTTON *arr[] = {&b1, &b2};
   handle_press_button(&b1);
-  watching_buttons_state_changes(&light, arr, 1);
+  handle_press_button(&b2);
+  watching_buttons_state_changes(&light, arr, 2);
   handle_switching_light(&light);
-  // change_light_mode(&light, &b1);
-  // handle_switching_light(&light, &b1);
-
   // debug messages
   // if (millis() % 100 == 0)
   // {
-  //   Serial.print("State: ");
+  //   Serial.print("B1 State: ");
   //   Serial.print(b1.state);
-  //   Serial.print(" Last state: ");
+  //   Serial.print(" B1 Last state: ");
   //   Serial.print(b1.last_state);
+  //   Serial.print(" B2 State: ");
+  //   Serial.print(b2.state);
+  //   Serial.print(" B2 Last state: ");
+  //   Serial.print(b2.last_state);
   //   Serial.print(" Light_state: ");
-  //   Serial.print(light.light_state / 1000);
+  //   Serial.print(light.light_state);
   //   Serial.print(" Light_mode: ");
   //   Serial.println(light.light_mode);
   // }
@@ -219,7 +240,7 @@ void handle_switching_light(M_STATE *id)
 {
 
   uint32_t current_time = millis();
-  uint32_t timeout_ms = TIMEOUT * 1000;
+  uint32_t timeout_ms = TIMEOUT * 1000 * 60;
   // handling timeout
   if (current_time - id->timestamp > timeout_ms)
   {
