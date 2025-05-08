@@ -1,28 +1,40 @@
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <ArduinoJson.h>
 
 // Todo:
 // - Timeout when light should turn off automaticaly
-// Working with few buttons
+// - Working with few buttons
 // Posibility to load pins number and working mode from external source then initialize it programmaticaly
+/* JSON example
+  {
+    type: "B", ("R" - relay, "B" - button)
+    pin: 10,
+  }
+*/
+// If button type M when timeout happens may should reset button state to 0
+// Relay struct and managing independent relay type (high or low signal triggered) by sending array 1 and 0 [1,0] [1,1] [0,1] [0,0] etc.
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
+// Need to check loaded data for M_STATE from EEPROM
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
 #define REL_1 A0
 #define REL_2 A1
-#define TIMEOUT 5
+#define TIMEOUT 5L
+#define MAX_BUTTONS 5
 
-typedef struct
+// Type and struct definitions:
+struct M_STATE
 {
   // Light can be turned on or off (1 or 0 respectively)
   uint8_t light_state;
   // Light mode can be cold white, warm white and mixed lamp turned on (1, 2, 3 respectively - like a byte [10000000], [01000000], [11000000])
   uint8_t light_mode;
   uint32_t timestamp;
-} M_STATE;
+};
 
-typedef struct
+struct BUTTON
 {
   uint8_t is_defined;          // levels of definition: 0 - not defined, 1 - defined
   uint8_t pin;                 // button pin on arduino
@@ -33,76 +45,97 @@ typedef struct
   uint8_t last_pin_state;      // previous cycle state on button pin: 0 - off state, 1 - on state
   uint32_t current_state_time; // time when current state was changed to ON state
   uint32_t last_state_time;    // last time when state was changed to ON state
-} BUTTON;
+};
+
+// Global variables:
+
+BUTTON buttons[MAX_BUTTONS];
+uint8_t buttons_count = 0;
 
 M_STATE light = {0, 3, 0};
-BUTTON b1 = {
-    0,
-    12,
-    127,
-    255,
-    255,
-    255,
-    0,
-    0};
-BUTTON b2 = {
-    0,
-    11,
-    127,
-    255,
-    255,
-    255,
-    0,
-    0};
+// BUTTON b1 = {
+//     0,
+//     12,
+//     127,
+//     255,
+//     255,
+//     255,
+//     0,
+//     0};
+// BUTTON b2 = {
+//     0,
+//     11,
+//     127,
+//     255,
+//     255,
+//     255,
+//     0,
+//     0};
+uint8_t const buf_len = 64;
+char input_buffer[buf_len];
+
+JsonDocument json;
+
 // put function declarations here:
 int digitalReadDebounce(int pin);
 void define_new_button(BUTTON *btn);
 int handle_press_button(BUTTON *btn);
 void m_state_rom(M_STATE *id, char action);
 int button_state_rom(BUTTON *btn, uint8_t btn_number, char action);
-void watching_buttons_state_changes(M_STATE *light, BUTTON *btns[], int btn_count);
+void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count);
 void change_light_mode(M_STATE *light, BUTTON *btn);
 void handle_switching_light(M_STATE *id);
+uint8_t read_input(char *buf, int len);
 
 void setup()
 {
   // put your setup code here, to run once:
+
   Serial.begin(9600);
-  while (!Serial)
-    ;
   pinMode(REL_1, OUTPUT);
   pinMode(REL_2, OUTPUT);
-  pinMode(b1.pin, INPUT_PULLUP);
-  pinMode(b2.pin, INPUT_PULLUP);
   digitalWrite(REL_1, HIGH);
   digitalWrite(REL_2, HIGH);
-  uint8_t is_loaded1 = button_state_rom(&b1, 1, 'L');
-  uint8_t is_loaded2 = button_state_rom(&b2, 2, 'L');
-  // Serial.print("Is loaded1 ");
-  // Serial.println(is_loaded1);
-  // Serial.print("Is loaded2: ");
-  // Serial.println(is_loaded2);
-  if (!is_loaded1)
+
+  // pinMode(b1.pin, INPUT_PULLUP);
+  // pinMode(b2.pin, INPUT_PULLUP);
+  // Serial.print("Is loaded: ");
+  // Serial.println(is_loaded);
+  for (int i = 0; i < MAX_BUTTONS; i++)
   {
-    define_new_button(&b1);
-    button_state_rom(&b1, 1, 'S');
+    uint8_t is_loaded = button_state_rom(&buttons[i], i, 'L');
+    if (is_loaded)
+    {
+      pinMode(buttons[i].pin, INPUT_PULLUP);
+      buttons_count++;
+    }
   }
-  else if (!is_loaded2)
-  {
-    define_new_button(&b2);
-    button_state_rom(&b2, 2, 'S');
-  }
+  Serial.print("Number of buttons: ");
+  Serial.println(buttons_count);
+  // else if (!is_loaded2)
+  // {
+  //   define_new_button(&b2);
+  //   button_state_rom(&b2, 2, 'S');
+  // }
   m_state_rom(&light, 'L');
 }
 
 void loop()
 {
   // put your main code here, to run repeatedly:
-  BUTTON *arr[] = {&b1, &b2};
-  handle_press_button(&b1);
-  handle_press_button(&b2);
-  watching_buttons_state_changes(&light, arr, 2);
+  // BUTTON *arr[] = {&b1, &b2};
+  handle_press_button(&buttons[0]);
+  handle_press_button(&buttons[1]);
+  watching_buttons_state_changes(&light, buttons, buttons_count);
   handle_switching_light(&light);
+  uint8_t new_data = read_input(input_buffer, buf_len);
+  if (new_data)
+  {
+    deserializeJson(json, input_buffer);
+    const int pin = json["pin"];
+    Serial.println(input_buffer);
+    Serial.println(pin);
+  }
   // debug messages
   // if (millis() % 100 == 0)
   // {
@@ -197,7 +230,7 @@ int handle_press_button(BUTTON *btn)
   return btn->state;
 }
 
-void watching_buttons_state_changes(M_STATE *light, BUTTON *btns[], int btn_count)
+void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count)
 {
   // This function watching for changing states of buttons and triggers nessesary functions or states in structs
   const int max_btn_count = 10;
@@ -215,22 +248,22 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns[], int btn_coun
     uint8_t matched = 0;
     for (int j = 0; j < btn_count; j++)
     {
-      if (btns[i]->pin == b_time[j].b_pin)
+      if (btns[i].pin == b_time[j].b_pin)
       {
-        if (btns[i]->state != b_time[j].last_b_state)
+        if (btns[i].state != b_time[j].last_b_state)
         {
-          light->light_state = btns[i]->state;
+          light->light_state = btns[i].state;
           light->timestamp = current_time;
-          change_light_mode(light, btns[i]);
+          change_light_mode(light, &btns[i]);
         }
-        b_time[j].last_b_state = btns[i]->state;
+        b_time[j].last_b_state = btns[i].state;
         matched = 1;
       }
     }
     if (!matched)
     {
-      b_time[i].b_pin = btns[i]->pin;
-      b_time[i].last_b_state = btns[i]->state;
+      b_time[i].b_pin = btns[i].pin;
+      b_time[i].last_b_state = btns[i].state;
     }
     matched = 0;
   }
@@ -311,17 +344,26 @@ void m_state_rom(M_STATE *id, char action)
   int address_offset_mode = address_offset_state + sizeof(id->light_state);
   if (action == 'S')
   {
-    uint8_t first_byte = EEPROM.put(address_offset_state, id->light_state);
-    uint8_t second_byte = EEPROM.put(address_offset_mode, id->light_mode);
-    Serial.println(first_byte);
-    Serial.println(second_byte);
+    /* Need to check loaded data*/
+    EEPROM.put(address_offset_state, 0); // always boot with turned off light
+    EEPROM.put(address_offset_mode, id->light_mode);
+    // uint8_t first_byte = EEPROM.put(address_offset_state, 0);
+    // uint8_t second_byte = EEPROM.put(address_offset_mode, id->light_mode);
+    //   Serial.print("Saved: light state - ");
+    //   Serial.print(first_byte);
+    //   Serial.print(" light mode - ");
+    //   Serial.println(second_byte);
   }
   else if (action == 'L')
   {
-    uint8_t first_byte = EEPROM.get(address_offset_state, id->light_state);
-    uint8_t second_byte = EEPROM.get(address_offset_mode, id->light_mode);
-    Serial.println(first_byte);
-    Serial.println(second_byte);
+    EEPROM.get(address_offset_state, id->light_state);
+    EEPROM.get(address_offset_mode, id->light_mode);
+    // uint8_t first_byte = EEPROM.get(address_offset_state, id->light_state);
+    // uint8_t second_byte = EEPROM.get(address_offset_mode, id->light_mode);
+    // Serial.print("Loaded: light state - ");
+    // Serial.print(first_byte);
+    // Serial.print(" light mode - ");
+    // Serial.println(second_byte);
   }
   return;
 }
@@ -334,10 +376,10 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
   // memory size occupied by BUTTON properties saved in EEPROM
   uint8_t button_address_offset = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
   // address offset depending of number of button
-  uint8_t address_offset = m_state_address_offset + button_address_offset * (btn_number - 1);
-  uint8_t pin_offset = address_offset + sizeof(btn->pin);
-  uint8_t type_offset = pin_offset + sizeof(btn->type);
-  BUTTON backup = *btn;
+  uint8_t pin_offset = m_state_address_offset + button_address_offset * btn_number;
+  uint8_t type_offset = pin_offset + member_size(BUTTON, pin);
+  uint8_t front_offset = type_offset + member_size(BUTTON, type);
+  BUTTON backup;
   if (action == 'S')
   {
     Serial.print("Saving....");
@@ -346,15 +388,15 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
       return 0;
     }
 
-    if (btn->pin != EEPROM.put(address_offset, btn->pin))
+    if (btn->pin != EEPROM.put(pin_offset, btn->pin))
     {
       return 0;
     }
-    if (btn->type != EEPROM.put(pin_offset, btn->type))
+    if (btn->type != EEPROM.put(type_offset, btn->type))
     {
       return 0;
     }
-    if (btn->front != EEPROM.put(type_offset, btn->front))
+    if (btn->front != EEPROM.put(front_offset, btn->front))
     {
       return 0;
     }
@@ -362,9 +404,9 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
   }
   else if (action == 'L')
   {
-    EEPROM.get(address_offset, backup.pin);
-    EEPROM.get(pin_offset, backup.type);
-    EEPROM.get(type_offset, backup.front);
+    EEPROM.get(pin_offset, backup.pin);
+    EEPROM.get(type_offset, backup.type);
+    EEPROM.get(front_offset, backup.front);
     if (backup.pin > 13 || backup.pin < 2)
     {
       return 0;
@@ -386,4 +428,63 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
     return 1;
   }
   return 0;
+}
+
+uint8_t read_input(char *buf, int len)
+{
+  // Function read data from serial to array and emits 0 if data still not finish and 1 when receiving data finish
+  static uint8_t ndx = 0;
+  static uint8_t receiving = 0;
+  char starting_byte = '{'; // receiving only json formated string started from { and ending with \n
+  char finish_byte = '\n';
+  char byte;
+
+  while (Serial.available() > 0)
+  {
+    byte = Serial.read();
+    if (ndx >= len)
+    {
+      ndx = len - 1;
+    }
+    if (receiving)
+    {
+      if (byte != finish_byte)
+      {
+        buf[ndx] = byte;
+        ndx++;
+      }
+      else if (byte == finish_byte)
+      {
+        buf[ndx] = '\0';
+        receiving = 0;
+        ndx = 0;
+        return 1;
+      }
+    }
+    else if (byte == starting_byte)
+    {
+      receiving = 1;
+      buf[ndx] = byte;
+      ndx++;
+    }
+  }
+  return 0;
+}
+
+void handle_input(char *input)
+{
+  uint8_t pin = 0;
+  signed char type;
+  JsonDocument json;
+
+  DeserializationError error = deserializeJson(json, input);
+
+  if (!error)
+  {
+    pin = json["pin"];
+    type = json["type"];
+    if (pin && type)
+    {
+    }
+  }
 }
