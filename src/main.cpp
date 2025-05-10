@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <stdlib.h>
 
 // Todo:
 // + Timeout when light should turn off automaticaly
@@ -104,8 +105,6 @@ M_STATE light = {0, 3, 0};
 uint8_t const buf_len = 64;
 char input_buffer[buf_len];
 
-JsonDocument json;
-
 // put function declarations here:
 int digitalReadDebounce(int pin);
 void define_new_button(BUTTON *btn);
@@ -117,6 +116,7 @@ void change_light_mode(M_STATE *light, BUTTON *btn);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
+int pin_to_int(const char *pin);
 
 void setup()
 {
@@ -158,6 +158,20 @@ void loop()
   for (int i = 0; i < buttons_count; i++)
   {
     handle_press_button(&buttons[i]);
+    // debug messages
+    // if (millis() % 100 == 0)
+    // {
+    //   Serial.print("B");
+    //   Serial.print(i);
+    //   Serial.print(" State: ");
+    //   Serial.print(buttons[i].state);
+    //   Serial.print(" Last state: ");
+    //   Serial.print(buttons[i].last_state);
+    //   Serial.print(" Light_state: ");
+    //   Serial.print(light.light_state);
+    //   Serial.print(" Light_mode: ");
+    //   Serial.println(light.light_mode);
+    // }
   }
   watching_buttons_state_changes(&light, buttons, buttons_count);
   handle_switching_light(&light);
@@ -172,54 +186,55 @@ void loop()
     Serial.println(new_devices.is_relay);
     if (new_devices.is_button)
     {
+      // Check if provided pin not already used if it is re-define that button
+      // If it new button and pin not used check if array of buttons not full
       define_new_button(new_devices.button);
-      int saved = button_state_rom(&buttons[buttons_count], buttons_count, 'S');
-      if (saved)
-        Serial.println("Button saved to ROM");
-      else
-        Serial.println("Button saving failed");
-      // buttons[buttons_count] = *new_devices.button;
-      buttons_count = buttons_count + 1;
-      Serial.print(" Buttons count: ");
-      Serial.println(buttons_count);
-      Serial.print("New button pin: ");
-      Serial.println(buttons[buttons_count - 1].pin);
-      Serial.print("New button def: ");
-      Serial.println(buttons[buttons_count - 1].is_defined);
-      Serial.print("New button type: ");
-      Serial.println(buttons[buttons_count - 1].type);
-      Serial.print("New button front: ");
-      Serial.println(buttons[buttons_count - 1].front);
+      if (new_devices.button->is_defined)
+      {
+        int saved = button_state_rom(new_devices.button, buttons_count, 'S');
+        if (saved)
+        {
+          buttons[buttons_count] = *new_devices.button;
+          free(new_devices.button);
+          Serial.println("Button saved to ROM");
+        }
+        else
+        {
+          free(new_devices.button);
+          Serial.println("Button saving failed");
+        }
+        // debug purpose
+        Serial.print(" Buttons count: ");
+        Serial.println(buttons_count);
+        Serial.print("New button pin: ");
+        Serial.println(buttons[buttons_count].pin);
+        Serial.print("New button def: ");
+        Serial.println(buttons[buttons_count].is_defined);
+        Serial.print("New button type: ");
+        Serial.println(buttons[buttons_count].type);
+        Serial.print("New button front: ");
+        Serial.println(buttons[buttons_count].front);
+        //
+        buttons_count = buttons_count + 1;
+      }
     }
     else if (new_devices.is_relay)
     {
       Serial.println("Relay");
+      free(new_devices.relay);
     }
     Serial.println("Finishing device definition");
     // Serial.println(input_buffer);
     // Serial.println(pin);
   }
-  // debug messages
-  // if (millis() % 100 == 0)
-  // {
-  //   Serial.print("B1 State: ");
-  //   Serial.print(b1.state);
-  //   Serial.print(" B1 Last state: ");
-  //   Serial.print(b1.last_state);
-  //   Serial.print(" B2 State: ");
-  //   Serial.print(b2.state);
-  //   Serial.print(" B2 Last state: ");
-  //   Serial.print(b2.last_state);
-  //   Serial.print(" Light_state: ");
-  //   Serial.print(light.light_state);
-  //   Serial.print(" Light_mode: ");
-  //   Serial.println(light.light_mode);
-  // }
 }
 // put function definitions here:
 void define_new_button(BUTTON *btn)
 {
   // on the first power on this function should recognize button type: e.g. maintained or momentary, high or low level
+  if (btn->pin < START_BTN_PIN || btn->pin > END_BTN_PIN)
+    return;
+
   pinMode(btn->pin, INPUT_PULLUP);
 
   unsigned long max_depress_time_ms = 300; // time need to depress and release momentary button
@@ -552,16 +567,16 @@ uint8_t read_input(char *buf, int len)
 
 PERIPHERALS handle_input(char *input)
 {
-  // It is possible return pointer or struct it self. Whan is the best from performans POV?
+  // This functions get received string from serial and tranform to json and analize what device is being added and return struct with pointer to cell in global arrays of devices and what kind of device it is being added
   PERIPHERALS dev;
   JsonDocument json;
   uint8_t invalid_param = 127;
-  BUTTON *btn = &buttons[buttons_count];
-  RELAY *relay = &relays[relays_count];
+  // need to handle case when array reaches maximum buttons
+  // BUTTON *btn = &buttons[buttons_count]; // get not accupied array member with buttons
+  // RELAY *relay = &relays[relays_count]; // get not occupied array member with relays
 
-  Serial.println(input);
   DeserializationError error = deserializeJson(json, input);
-  Serial.println(error.c_str());
+
   if (error)
   {
     dev.is_button = 0;
@@ -571,45 +586,65 @@ PERIPHERALS handle_input(char *input)
     return dev;
   }
 
-  serializeJson(json, Serial);
-  int pin = json["pin"];
+  int pin = pin_to_int(json["pin"].as<const char *>());
+  pin = pin <= 0 ? json["pin"] : pin; // It need cause json["pin"].as<const char *> can't convert number from json to string
   const char *device_type = json["device"];
-  Serial.print("Pin: ");
-  Serial.println(pin);
-  Serial.print("device_type: ");
-  Serial.println(device_type[0]);
+
   if (device_type[0] == 'B')
   {
+    BUTTON *btn = (BUTTON *)malloc(sizeof(BUTTON));
+    if (!btn)
+    {
+      dev.is_button = 0;
+      dev.button = 0;
+      dev.is_relay = 0;
+      dev.relay = 0;
+      return dev;
+    }
+
     dev.is_relay = 0;
     dev.relay = 0;
+
     btn->pin = (pin >= START_BTN_PIN ? (pin <= END_BTN_PIN ? pin : invalid_param) : invalid_param);
     if (btn->pin == invalid_param)
     {
       dev.is_button = 0;
       dev.button = 0;
     }
-    btn->is_defined = 0;
-    dev.is_button = 1;
-    dev.button = btn;
+    else
+    {
+      btn->is_defined = 0;
+      dev.is_button = 1;
+      dev.button = btn;
+    }
   }
   else if (device_type[0] == 'R')
   {
+    RELAY *relay = (RELAY *)malloc(sizeof(RELAY));
+    if (!relay)
+    {
+      dev.is_button = 0;
+      dev.button = 0;
+      dev.is_relay = 0;
+      dev.relay = 0;
+      return dev;
+    }
+    const char *rel_type = json["type"];
+
     dev.is_button = 0;
     dev.button = 0;
-
-    const char *rel_type = json["type"];
-    Serial.print("rel_type: ");
-    Serial.println(rel_type[0]);
     relay->pin = (pin >= START_REL_PIN ? (pin <= END_REL_PIN ? pin : invalid_param) : invalid_param); // Check if pin in right range
     relay->type = ((rel_type[0] == 'L') || (rel_type[0] == 'H') ? rel_type[0] : invalid_param);       // Check if json have only H of L for relay type
     if (relay->pin == invalid_param || relay->type == invalid_param)
     {
       dev.is_relay = 0;
       dev.relay = 0;
-      return dev;
     }
-    dev.is_relay = 1;
-    dev.relay = relay;
+    else
+    {
+      dev.is_relay = 1;
+      dev.relay = relay;
+    }
   }
   else
   {
@@ -617,7 +652,43 @@ PERIPHERALS handle_input(char *input)
     dev.button = 0;
     dev.is_relay = 0;
     dev.relay = 0;
-    return dev;
   }
+
   return dev;
+}
+
+int pin_to_int(const char *pin)
+{
+  // Function convert analog pin number in string form from input to digital pin number
+  // e.g. A0 -> 14, A1 -> 15, A2 -> 16, A3 -> 17, A4 -> 18, A5 -> 19
+  Serial.print("Inside pin_to_int pin: ");
+  Serial.println(pin);
+  if (pin[0] == 'A')
+  {
+    int pin_number = atoi(pin + 1);
+    if (pin_number + 14 >= A0 && pin_number + 14 <= A7)
+    {
+      return pin_number + 14;
+    }
+  }
+  else if (pin[0] == 'D')
+  {
+    int pin_number = atoi(pin + 1);
+    if (pin_number >= START_BTN_PIN && pin_number <= END_BTN_PIN)
+    {
+      return pin_number;
+    }
+  }
+  else
+  {
+    int pin_number = atoi(pin);
+    if ((pin_number >= START_BTN_PIN && pin_number <= END_BTN_PIN) ||
+        (pin_number >= START_REL_PIN && pin_number <= END_REL_PIN))
+    {
+      return pin_number;
+    }
+  }
+  // If pin is not in range return -1
+
+  return -1;
 }
