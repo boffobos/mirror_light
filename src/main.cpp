@@ -20,11 +20,13 @@
     "type":"L"
   }
 */
+// At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
 // If button type M when timeout happens may should reset button state to 0
 // Relay struct and managing independent relay type (high or low signal triggered) by sending array 1 and 0 [1,0] [1,1] [0,1] [0,0] etc.
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
 // Need to check loaded data for M_STATE from EEPROM
+// momentary button may should't have defined state. It should emits only changing signal levels.
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
 #define REL_1 A0
@@ -36,8 +38,10 @@
 #define END_BTN_PIN 13   // Define last GPIO in the row for buttons
 #define START_REL_PIN A0 // Define first GPIO in the row for relays
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
+#define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
 
 // Type and struct definitions:
+
 struct M_STATE
 {
   // Light can be turned on or off (1 or 0 respectively)
@@ -84,34 +88,18 @@ struct RELAY relays[MAX_RELAYS];
 uint8_t relays_count = 0;
 
 M_STATE light = {0, 3, 0};
-// BUTTON b1 = {
-//     0,
-//     12,
-//     127,
-//     255,
-//     255,
-//     255,
-//     0,
-//     0};
-// BUTTON b2 = {
-//     0,
-//     11,
-//     127,
-//     255,
-//     255,
-//     255,
-//     0,
-//     0};
-uint8_t const buf_len = 64;
-char input_buffer[buf_len];
+
+char input_buffer[JSON_BUFFER];
 
 // put function declarations here:
 int digitalReadDebounce(int pin);
 void define_new_button(BUTTON *btn);
 int handle_press_button(BUTTON *btn);
-void m_state_rom(M_STATE *id, char action);
-int button_state_rom(BUTTON *btn, uint8_t btn_number, char action);
+uint8_t m_state_rom(M_STATE *id, char action);
+int button_rom(BUTTON *btn, uint8_t btn_number, char action);
+int relay_rom(RELAY *relay, uint8_t relay_number, char action);
 void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count);
+uint8_t set_relay_state(RELAY *relay, uint8_t to_state);
 void change_light_mode(M_STATE *light, BUTTON *btn);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
@@ -123,32 +111,43 @@ void setup()
   // put your setup code here, to run once:
 
   Serial.begin(9600);
-  pinMode(REL_1, OUTPUT);
-  pinMode(REL_2, OUTPUT);
-  digitalWrite(REL_1, HIGH);
-  digitalWrite(REL_2, HIGH);
+  for (int i = 0; i < MAX_RELAYS; i++)
+  {
+    uint8_t is_loaded = relay_rom(&relays[i], i, 'L');
+    if (is_loaded)
+    {
+      // Serial.println(F("Relay loaded succesfully"));
+      pinMode(relays[i].pin, OUTPUT);
+      set_relay_state(&relays[i], 0);
+      relays_count++;
+    }
+    else
+    {
+      // Serial.println(F("Failed to load relay config from ROM"));
+    }
+  }
+  Serial.print(F("Relays count: "));
+  Serial.println(relays_count);
 
-  // pinMode(b1.pin, INPUT_PULLUP);
-  // pinMode(b2.pin, INPUT_PULLUP);
-  // Serial.print("Is loaded: ");
-  // Serial.println(is_loaded);
   for (int i = 0; i < MAX_BUTTONS; i++)
   {
-    uint8_t is_loaded = button_state_rom(&buttons[i], i, 'L');
+    uint8_t is_loaded = button_rom(&buttons[i], i, 'L');
     if (is_loaded)
     {
       pinMode(buttons[i].pin, INPUT_PULLUP);
       buttons_count++;
     }
+    else
+    {
+      // Serial.println(F("Faled to load button config from ROM"));
+    }
   }
-  Serial.print("Number of buttons: ");
+  Serial.print(F("Number of buttons: "));
   Serial.println(buttons_count);
-  // else if (!is_loaded2)
-  // {
-  //   define_new_button(&b2);
-  //   button_state_rom(&b2, 2, 'S');
-  // }
-  m_state_rom(&light, 'L');
+
+  uint8_t is_loaded = m_state_rom(&light, 'L');
+  if (!is_loaded)
+    Serial.println(F("Light config failed to load from ROM"));
 }
 
 void loop()
@@ -175,14 +174,14 @@ void loop()
   }
   watching_buttons_state_changes(&light, buttons, buttons_count);
   handle_switching_light(&light);
-  uint8_t new_data = read_input(input_buffer, buf_len);
+  uint8_t new_data = read_input(input_buffer, JSON_BUFFER);
   if (new_data)
   {
     PERIPHERALS new_devices = handle_input(input_buffer);
     Serial.println("New device: ");
-    Serial.print("is_button: ");
+    Serial.print(F("is_button: "));
     Serial.println(new_devices.is_button);
-    Serial.print("is_relay: ");
+    Serial.print(F("is_relay: "));
     Serial.println(new_devices.is_relay);
     if (new_devices.is_button)
     {
@@ -191,39 +190,46 @@ void loop()
       define_new_button(new_devices.button);
       if (new_devices.button->is_defined)
       {
-        int saved = button_state_rom(new_devices.button, buttons_count, 'S');
+        int saved = button_rom(new_devices.button, buttons_count, 'S');
         if (saved)
         {
           buttons[buttons_count] = *new_devices.button;
-          free(new_devices.button);
           Serial.println("Button saved to ROM");
         }
         else
         {
-          free(new_devices.button);
           Serial.println("Button saving failed");
         }
         // debug purpose
-        Serial.print(" Buttons count: ");
+        Serial.print(F(" Buttons count: "));
         Serial.println(buttons_count);
-        Serial.print("New button pin: ");
+        Serial.print(F("New button pin: "));
         Serial.println(buttons[buttons_count].pin);
-        Serial.print("New button def: ");
+        Serial.print(F("New button def: "));
         Serial.println(buttons[buttons_count].is_defined);
-        Serial.print("New button type: ");
+        Serial.print(F("New button type: "));
         Serial.println(buttons[buttons_count].type);
-        Serial.print("New button front: ");
+        Serial.print(F("New button front: "));
         Serial.println(buttons[buttons_count].front);
         //
         buttons_count = buttons_count + 1;
+        free(new_devices.button);
       }
     }
     else if (new_devices.is_relay)
     {
-      Serial.println("Relay");
+      if (relays_count < MAX_RELAYS)
+      {
+        relays[relays_count] = *new_devices.relay;
+        int is_saved = relay_rom(&relays[relays_count], relays_count, 'S');
+        if (is_saved)
+          Serial.println("Relay saved to ROM");
+
+        relays_count++;
+      }
       free(new_devices.relay);
     }
-    Serial.println("Finishing device definition");
+    // Serial.println("Finishing device definition");
     // Serial.println(input_buffer);
     // Serial.println(pin);
   }
@@ -356,6 +362,42 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count
   }
 }
 
+uint8_t set_relay_state(RELAY *relay, uint8_t to_state)
+{
+  // Function take relay pointer and change state to on(1) or off(0)
+  if (relay->type == 'H')
+  {
+    if (to_state == 1)
+    {
+      digitalWrite(relay->pin, HIGH);
+      relay->state = to_state;
+    }
+    else if (to_state == 0)
+    {
+      digitalWrite(relay->pin, LOW);
+      relay->state = to_state;
+    }
+  }
+  else if (relay->type == 'L')
+  {
+    if (to_state == 1)
+    {
+      digitalWrite(relay->pin, LOW);
+      relay->state = to_state;
+    }
+    else if (to_state == 0)
+    {
+      digitalWrite(relay->pin, HIGH);
+      relay->state = to_state;
+    }
+  }
+  else
+  {
+    relay->state = 0;
+  }
+  return relay->state;
+}
+
 void handle_switching_light(M_STATE *id)
 {
 
@@ -369,25 +411,25 @@ void handle_switching_light(M_STATE *id)
 
   if (id->light_state == 0)
   {
-    digitalWrite(REL_1, HIGH);
-    digitalWrite(REL_2, HIGH);
+    set_relay_state(&relays[0], 0);
+    set_relay_state(&relays[1], 0);
     return;
   }
 
   if (id->light_mode == 1)
   {
-    digitalWrite(REL_1, LOW);
-    digitalWrite(REL_2, HIGH);
+    set_relay_state(&relays[0], 1);
+    set_relay_state(&relays[1], 0);
   }
   else if (id->light_mode == 2)
   {
-    digitalWrite(REL_1, HIGH);
-    digitalWrite(REL_2, LOW);
+    set_relay_state(&relays[0], 0);
+    set_relay_state(&relays[1], 1);
   }
   else if (id->light_mode == 3)
   {
-    digitalWrite(REL_1, LOW);
-    digitalWrite(REL_2, LOW);
+    set_relay_state(&relays[0], 1);
+    set_relay_state(&relays[1], 1);
   }
   return;
 }
@@ -424,16 +466,20 @@ int digitalReadDebounce(int pin)
   return pin_state_accumulator / counter;
 }
 
-void m_state_rom(M_STATE *id, char action)
+uint8_t m_state_rom(M_STATE *id, char action)
 {
   // Need to verify saving and loaded data
   int address_offset_state = 0;
   int address_offset_mode = address_offset_state + sizeof(id->light_state);
+  uint8_t max_mode = 3;
   if (action == 'S')
   {
     /* Need to check loaded data*/
-    EEPROM.put(address_offset_state, 0); // always boot with turned off light
-    EEPROM.put(address_offset_mode, id->light_mode);
+    // EEPROM.put(address_offset_state, 0); // always boot with turned off light
+    if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
+      return 0;
+
+    return 1;
     // uint8_t first_byte = EEPROM.put(address_offset_state, 0);
     // uint8_t second_byte = EEPROM.put(address_offset_mode, id->light_mode);
     //   Serial.print("Saved: light state - ");
@@ -443,19 +489,26 @@ void m_state_rom(M_STATE *id, char action)
   }
   else if (action == 'L')
   {
-    EEPROM.get(address_offset_state, id->light_state);
+    // EEPROM.get(address_offset_state, id->light_state);
+    id->light_state = 0; // set light off when boot
     EEPROM.get(address_offset_mode, id->light_mode);
+    if (id->light_mode < 1 || id->light_mode > max_mode)
+    {
+      id->light_mode = max_mode;
+      return 1;
+    }
     // uint8_t first_byte = EEPROM.get(address_offset_state, id->light_state);
     // uint8_t second_byte = EEPROM.get(address_offset_mode, id->light_mode);
     // Serial.print("Loaded: light state - ");
     // Serial.print(first_byte);
     // Serial.print(" light mode - ");
     // Serial.println(second_byte);
+    return 1;
   }
-  return;
+  return 0;
 }
 
-int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
+int button_rom(BUTTON *btn, uint8_t btn_number, char action)
 {
   // Function save or load button state from EEPROM. action has 2 options: 'S' - save, 'L' - load
   // memory size occupied by M_STATE properties saved in EEPROM
@@ -466,10 +519,9 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
   uint8_t pin_offset = m_state_address_offset + button_address_offset * btn_number;
   uint8_t type_offset = pin_offset + member_size(BUTTON, pin);
   uint8_t front_offset = type_offset + member_size(BUTTON, type);
-  BUTTON backup;
   if (action == 'S')
   {
-    Serial.println("Saving....");
+    Serial.println(F("Button saving..."));
     if (!btn->is_defined)
       return 0;
 
@@ -483,21 +535,20 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
       return 0;
 
     if (btn->pin != EEPROM.put(pin_offset, btn->pin))
-    {
       return 0;
-    }
+
     if (btn->type != EEPROM.put(type_offset, btn->type))
-    {
       return 0;
-    }
+
     if (btn->front != EEPROM.put(front_offset, btn->front))
-    {
       return 0;
-    }
+
     return 1;
   }
   else if (action == 'L')
   {
+    Serial.println(F("Button loading..."));
+    BUTTON backup;
     EEPROM.get(pin_offset, backup.pin);
     EEPROM.get(type_offset, backup.type);
     EEPROM.get(front_offset, backup.front);
@@ -519,6 +570,50 @@ int button_state_rom(BUTTON *btn, uint8_t btn_number, char action)
     backup.current_state_time = millis();
     backup.last_state_time = 0;
     *btn = backup;
+    return 1;
+  }
+  return 0;
+}
+
+int relay_rom(RELAY *relay, uint8_t relay_number, char action) // Function save or load relay data from/to EEPROM
+{
+  // Function save or load relay data from/to EEPROM
+  uint8_t m_state_address_offset = member_size(M_STATE, light_state) + member_size(M_STATE, light_mode);
+  // memory size occupied by BUTTON properties saved in EEPROM
+  uint8_t button_address_offset = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
+  // memory size occupied by RELAY properties saved in EEPROM
+  uint8_t relay_address_offset = member_size(RELAY, pin) + member_size(RELAY, type);
+  uint8_t pin_offset = m_state_address_offset + button_address_offset * MAX_BUTTONS + relay_address_offset * relay_number;
+  uint8_t type_offset = pin_offset + member_size(RELAY, pin);
+
+  if (action == 'S')
+  {
+    Serial.println(F("Saving relay..."));
+    if (relay->pin < START_REL_PIN || relay->pin > END_REL_PIN)
+      return 0;
+    if (relay->type != 'H' && relay->type != 'L')
+      return 0;
+    if (relay->pin != EEPROM.put(pin_offset, relay->pin))
+      return 0;
+    if (relay->type != EEPROM.put(type_offset, relay->type))
+      return 0;
+
+    return 1;
+  }
+  else if (action == 'L')
+  {
+    Serial.println(F("Loading relay..."));
+    RELAY temp_rel;
+    EEPROM.get(pin_offset, temp_rel.pin);
+    EEPROM.get(type_offset, temp_rel.type);
+
+    temp_rel.state = 0;
+    if (temp_rel.pin < START_REL_PIN || temp_rel.pin > END_REL_PIN)
+      return 0;
+    if (temp_rel.type != 'H' && temp_rel.type != 'L')
+      return 0;
+    *relay = temp_rel;
+
     return 1;
   }
   return 0;
