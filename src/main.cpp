@@ -1,12 +1,14 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+// // debuger lib
+// #include "avr8-stub.h"
+// #include "app_api.h"
 
 // Todo:
 // + Timeout when light should turn off automaticaly
 // + Working with few buttons
-// +/- Posibility to load pins number and working mode from external source then initialize it programmaticaly
-//  Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
+// + Posibility to load pins number and working mode from external source then initialize it programmaticaly
 /* JSON example for buttons
   {
     "pin":10,
@@ -19,17 +21,20 @@
     "type":"L"
   }
 */
+// + Relay struct and managing independent on relay type (high or low signal triggered) by sending array 1 and 0 [1,0] [1,1] [0,1] [0,0] etc.
+// Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
 // At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
 // If button type M when timeout happens may should reset button state to 0
+// Momentary button may should't have defined state. It should emits only changing signal levels.
 // Posibility to remove devices
-// Relay struct and managing independent relay type (high or low signal triggered) by sending array 1 and 0 [1,0] [1,1] [0,1] [0,0] etc.
+// Additional to define new devices need to receive JSON with commands, that could change eg. light_state, light_mode, timeout etc.
+////////////////////////////////////////
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
 // Need to check loaded data for M_STATE from EEPROM
-// momentary button may should't have defined state. It should emits only changing signal levels.
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
-#define TIMEOUT 5L
+#define INITIAL_TIMEOUT 20L
 #define MAX_BUTTONS 5
 #define MAX_RELAYS 5
 #define START_BTN_PIN 2  // Define first GPIO in the row for buttons
@@ -37,7 +42,8 @@
 #define START_REL_PIN A0 // Define first GPIO in the row for relays
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
 #define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
-#define DEBUG 0          // Switch some serial ouput
+#define DEBUGING 0       // Switch some serial ouput for debuging purpose
+#define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
 
 // Type and struct definitions:
 
@@ -49,6 +55,7 @@ struct M_STATE
   uint8_t light_mode;
   uint32_t timestamp;
   uint8_t max_light_mode;
+  uint8_t light_timeout;
 };
 
 struct BUTTON
@@ -67,7 +74,7 @@ struct BUTTON
 struct RELAY
 {
   uint8_t pin;   // that is pin relay connected to
-  char type;     // 'L' - low state relay, 'H' - high state relay (triggered by LOW of HIGH signar respectively)
+  char type;     // 'L' - low triggered relay, 'H' - high triggered relay
   uint8_t state; // 0 - relay is turned off, 1 - turned on
 };
 
@@ -87,7 +94,7 @@ uint8_t buttons_count = 0;
 struct RELAY relays[MAX_RELAYS];
 uint8_t relays_count = 0;
 
-M_STATE light = {0, 3, 0, 0};
+M_STATE light; // need to initialize in runtime
 
 char input_buffer[JSON_BUFFER];
 
@@ -107,11 +114,21 @@ void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
 int pin_to_int(const char *pin);
+int power(int x, int y);
 
 void setup()
 {
   // put your setup code here, to run once:
-
+  // Clean ROM before start
+  if (CLEAN_ROM)
+  {
+    for (uint16_t i = 0; i < EEPROM.length(); i++)
+    {
+      EEPROM.put(i, 0);
+    }
+  }
+  // debug_init();
+  //////////////////
   Serial.begin(9600);
   Serial.println(F("Loading relays..."));
   for (int i = 0; i < MAX_RELAYS; i++)
@@ -153,14 +170,13 @@ void setup()
   if (!is_loaded)
   {
     Serial.println(F("Light config failed to load from ROM"));
+    light.light_state = 0;
+    light.max_light_mode = power(2, relays_count) - 1;
+    light.light_mode = light.max_light_mode;
   }
   else
   {
-    uint8_t max_mode = 1;
-    for (int i = 0; i < relays_count; i++)
-      max_mode *= 2;
-
-    light.max_light_mode = max_mode - 1;
+    light.max_light_mode = power(2, relays_count) - 1;
   }
 }
 
@@ -171,7 +187,7 @@ void loop()
   {
     handle_press_button(&buttons[i]);
     // debug messages
-    if (DEBUG)
+    if (DEBUGING)
     {
 
       if (millis() % 1000 == 0)
@@ -225,7 +241,7 @@ void loop()
           Serial.println("Button saving failed");
         }
         // debug purpose
-        if (DEBUG)
+        if (DEBUGING)
         {
           Serial.print(F(" Buttons count: "));
           Serial.println(buttons_count);
@@ -278,7 +294,7 @@ void define_new_button(BUTTON *btn)
   int btn_prev_state = current_signal_state;
 
   // Debug purpose
-  if (DEBUG)
+  if (DEBUGING)
   {
     Serial.println("From define_new_button");
     Serial.print("Button pin: ");
@@ -447,6 +463,7 @@ void handle_relays_switching(RELAY relays[], uint8_t control[])
 
 uint8_t dec_to_bin_arr(uint8_t number, uint8_t *arr, uint8_t arr_size)
 {
+  // function convert number (represent light_mode) to array of 0 and 1 to control array of relays with this array. Nuber represent byte, every bit in this byte meaning relay state need to set up so it convert dec number to binary representation
   int dividend = number;
   for (int i = 0; i < arr_size; i++)
   {
@@ -460,7 +477,7 @@ void handle_switching_light(M_STATE *id)
 {
 
   uint32_t current_time = millis();
-  uint32_t timeout_ms = TIMEOUT * 1000 * 60;
+  uint32_t timeout_ms = INITIAL_TIMEOUT * 1000 * 60;
   uint8_t arr[relays_count];
   // handling timeout
   if (current_time - id->timestamp > timeout_ms)
@@ -473,8 +490,7 @@ void handle_switching_light(M_STATE *id)
     uint8_t result = dec_to_bin_arr(0, arr, relays_count);
     if (result)
       handle_relays_switching(relays, arr);
-    // set_relay_state(&relays[0], 0);
-    // set_relay_state(&relays[1], 0);
+
     return;
   }
   else if (id->light_state == 1)
@@ -485,40 +501,23 @@ void handle_switching_light(M_STATE *id)
     return;
   }
 
-  if (id->light_mode == 1)
-  {
-    set_relay_state(&relays[0], 1);
-    set_relay_state(&relays[1], 0);
-  }
-  else if (id->light_mode == 2)
-  {
-    set_relay_state(&relays[0], 0);
-    set_relay_state(&relays[1], 1);
-  }
-  else if (id->light_mode == 3)
-  {
-    set_relay_state(&relays[0], 1);
-    set_relay_state(&relays[1], 1);
-  }
   return;
 }
 
 void change_light_mode(M_STATE *light, BUTTON *btn)
 {
+  // may need to change this code to not use btn
   unsigned int double_click_interval_ms = 200;
   uint32_t t2 = btn->current_state_time;
   uint32_t t1 = btn->last_state_time;
 
   uint8_t max_light_mode = light->max_light_mode;
+
   if (max_light_mode == 0 && relays_count != 0)
-  {
-    max_light_mode = 1;
-    for (int i = 0; i < relays_count; i++)
-      max_light_mode *= 2;
-    max_light_mode = max_light_mode - 1;
-  }
-  // may need to change this code to not use btn
+    max_light_mode = power(2, relays_count) - 1;
+
   light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
+
   if (t2 - t1 <= double_click_interval_ms && t1 != 0)
   {
     light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
@@ -549,16 +548,16 @@ uint8_t m_state_rom(M_STATE *id, char action)
   // Need to verify saving and loaded data
   int address_offset_state = 0;
   int address_offset_mode = address_offset_state + sizeof(id->light_state);
-  uint8_t max_mode = 3;
+  uint8_t max_mode = power(2, relays_count) - 1;
   if (action == 'S')
   {
-    /* Need to check loaded data*/
     if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
       return 0;
 
     return 1;
   }
   else if (action == 'L')
+  /* Need to check loaded data*/
   {
     // EEPROM.get(address_offset_state, id->light_state);
     id->light_state = 0; // set light off when boot
@@ -848,4 +847,14 @@ int pin_to_int(const char *pin)
   }
   // If pin is not in range return -1
   return -1;
+}
+
+int power(int x, int y)
+{
+  int res = 1;
+
+  for (int i = 0; i < y; i++)
+    res *= x;
+
+  return res;
 }
