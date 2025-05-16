@@ -32,6 +32,7 @@
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
 // Need to check loaded data for M_STATE from EEPROM
+// May should blink with light when button is defined
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
 #define INITIAL_TIMEOUT 20L
@@ -44,6 +45,7 @@
 #define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
 #define DEBUGING 0       // Switch some serial ouput for debuging purpose
 #define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
+#define DOUBLE_CLICK_TIME 500
 
 // Type and struct definitions:
 
@@ -109,7 +111,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count
 uint8_t set_relay_state(RELAY *relay, uint8_t to_state);
 void handle_relays_switching(RELAY relays[], uint8_t control[]);
 uint8_t dec_to_bin_arr(uint8_t number, uint8_t arr, uint8_t arr_size);
-void change_light_mode(M_STATE *light, BUTTON *btn);
+void change_light_mode(M_STATE *light);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
@@ -338,76 +340,104 @@ void define_new_button(BUTTON *btn)
 int handle_press_button(BUTTON *btn)
 {
   // this function handle presses on buttons and write this data to button struct
-  int current_signal_state = digitalReadDebounce(btn->pin);
+  uint8_t current_signal = digitalReadDebounce(btn->pin);
+  uint8_t last_signal = btn->last_pin_state;
+  uint8_t front = btn->front;
+  int8_t state = 0;
   unsigned long current_time = millis();
 
-  if (btn->type == 'L')
+  if (current_signal != last_signal)
   {
-    if (current_signal_state != btn->last_pin_state)
+    Serial.println("Level changed");
+    if (current_signal == HIGH)
     {
-      // set button state dependig of button front
-      btn->last_state_time = btn->current_state_time;
-      btn->state = current_signal_state == btn->front ? 1 : 0;
-      btn->current_state_time = current_time;
-    }
-  }
-  else if (btn->type == 'M')
-  {
-    if (current_signal_state != btn->last_pin_state)
-    {
-      if (current_signal_state == btn->front)
+      Serial.println("To HIGHT");
+      if (front == 0)
       {
-        btn->state = btn->state;
+        state = -1;
       }
-      else
+      else if (front == 1)
       {
+        state = 1;
+        // This is mean that double click counts between two fronts of signal of high-level button
         btn->last_state_time = btn->current_state_time;
-        btn->state = !btn->state;
         btn->current_state_time = current_time;
       }
     }
+    else
+    {
+      Serial.println("To LOW");
+      if (front == 0)
+      {
+        state = 1;
+        // This is mean that double click counts between two fronts of signal of low-level button
+        btn->last_state_time = btn->current_state_time;
+        btn->current_state_time = current_time;
+      }
+      else if (front == 1)
+      {
+        state = -1;
+      }
+    }
   }
-  btn->last_pin_state = current_signal_state;
-
+  else
+  {
+    state = 0;
+  }
+  btn->last_pin_state = current_signal;
+  btn->state = state;
   return btn->state;
 }
 
-void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count)
+void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
 {
-  // This function watching for changing states of buttons and triggers nessesary functions or states in structs
-  const int max_btn_count = MAX_BUTTONS;
+  // This function watching for changing states of buttons and triggers nessesary functions or states of objects
   uint32_t current_time = millis();
-  struct b_state
-  {
-    uint8_t b_pin;
-    uint32_t last_b_state;
-  };
-
-  static struct b_state b_time[max_btn_count];
+  static uint8_t is_double_click_waiting = 0;
+  static uint32_t timestamp;
 
   for (int i = 0; i < btn_count; i++)
   {
-    uint8_t matched = 0;
-    for (int j = 0; j < btn_count; j++)
+    int8_t state = btns[i].state;
+    int8_t type = btns[i].type;
+
+    if (is_double_click_waiting == 1 && current_time - timestamp > DOUBLE_CLICK_TIME)
     {
-      if (btns[i].pin == b_time[j].b_pin)
+      is_double_click_waiting = 0;
+      timestamp = 0;
+      light->light_state = !light->light_state;
+      light->timestamp = current_time;
+    }
+
+    if (state == 1)
+    {
+      if (is_double_click_waiting == 1)
       {
-        if (btns[i].state != b_time[j].last_b_state)
+        is_double_click_waiting = 0;
+        timestamp = 0;
+        change_light_mode(light);
+
+        // when light_mode changed during light is turned off need to light turn on
+        if (light->light_state == 0)
         {
-          light->light_state = btns[i].state; // change avoid dependecy of light_state on button_state. Changing button states shoul !switch light state
+          light->light_state = !light->light_state;
           light->timestamp = current_time;
-          change_light_mode(light, &btns[i]); // to check if pressing was double or not
         }
-        b_time[j].last_b_state = btns[i].state;
-        matched = 1;
+      }
+      else
+      {
+        is_double_click_waiting = 1;
+        timestamp = current_time;
       }
     }
-    if (!matched)
+    else if (state == -1)
     {
-      b_time[i].b_pin = btns[i].pin;
-      b_time[i].last_b_state = btns[i].state;
+      if (type == 'L' && light->light_state == 1)
+      {
+        light->light_state = !light->light_state;
+        light->timestamp = current_time;
+      }
     }
-    matched = 0;
   }
 }
 
@@ -475,7 +505,6 @@ uint8_t dec_to_bin_arr(uint8_t number, uint8_t *arr, uint8_t arr_size)
 
 void handle_switching_light(M_STATE *id)
 {
-
   uint32_t current_time = millis();
   uint32_t timeout_ms = INITIAL_TIMEOUT * 1000 * 60;
   uint8_t arr[relays_count];
@@ -504,25 +533,18 @@ void handle_switching_light(M_STATE *id)
   return;
 }
 
-void change_light_mode(M_STATE *light, BUTTON *btn)
+void change_light_mode(M_STATE *light)
 {
-  // may need to change this code to not use btn
-  unsigned int double_click_interval_ms = 200;
-  uint32_t t2 = btn->current_state_time;
-  uint32_t t1 = btn->last_state_time;
 
   uint8_t max_light_mode = light->max_light_mode;
 
   if (max_light_mode == 0 && relays_count != 0)
     max_light_mode = power(2, relays_count) - 1;
 
+  light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
   light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
+  m_state_rom(light, 'S');
 
-  if (t2 - t1 <= double_click_interval_ms && t1 != 0)
-  {
-    light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
-    m_state_rom(light, 'S');
-  }
   return;
 }
 
