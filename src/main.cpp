@@ -57,7 +57,7 @@ struct M_STATE
   uint8_t light_mode;
   uint32_t timestamp;
   uint8_t max_light_mode;
-  uint8_t light_timeout;
+  uint8_t avg_on_duration;
 };
 
 struct BUTTON
@@ -107,11 +107,12 @@ int handle_press_button(BUTTON *btn);
 uint8_t m_state_rom(M_STATE *id, char action);
 int button_rom(BUTTON *btn, uint8_t btn_number, char action);
 int relay_rom(RELAY *relay, uint8_t relay_number, char action);
-void watching_buttons_state_changes(M_STATE *light, BUTTON btns[], int btn_count);
+void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count);
 uint8_t set_relay_state(RELAY *relay, uint8_t to_state);
 void handle_relays_switching(RELAY relays[], uint8_t control[]);
-uint8_t dec_to_bin_arr(uint8_t number, uint8_t arr, uint8_t arr_size);
+uint8_t dec_to_bin_arr(uint8_t number, uint8_t *arr, uint8_t arr_size);
 void change_light_mode(M_STATE *light);
+int toggle_light(M_STATE *light, uint8_t state);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
@@ -175,6 +176,7 @@ void setup()
     light.light_state = 0;
     light.max_light_mode = power(2, relays_count) - 1;
     light.light_mode = light.max_light_mode;
+    light.avg_on_duration = 0;
   }
   else
   {
@@ -405,8 +407,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
     {
       is_double_click_waiting = 0;
       timestamp = 0;
-      light->light_state = !light->light_state;
-      light->timestamp = current_time;
+      toggle_light(light, !light->light_state);
     }
 
     if (state == 1)
@@ -419,10 +420,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
 
         // when light_mode changed during light is turned off need to light turn on
         if (light->light_state == 0)
-        {
-          light->light_state = !light->light_state;
-          light->timestamp = current_time;
-        }
+          toggle_light(light, !light->light_state);
       }
       else
       {
@@ -433,10 +431,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
     else if (state == -1)
     {
       if (type == 'L' && light->light_state == 1)
-      {
-        light->light_state = !light->light_state;
-        light->timestamp = current_time;
-      }
+        toggle_light(light, !light->light_state);
     }
   }
 }
@@ -546,6 +541,38 @@ void change_light_mode(M_STATE *light)
   m_state_rom(light, 'S');
 
   return;
+}
+
+int toggle_light(M_STATE *light, uint8_t state)
+{
+  uint32_t current_time = millis();
+
+  if (light->avg_on_duration == 0 && light->timestamp != 0)
+  {
+    if (state == 0)
+    {
+      uint8_t duration = (current_time - light->timestamp) / (1000U * 60U);
+      light->avg_on_duration = duration;
+    }
+  }
+
+  if (state == 0)
+  {
+    uint8_t duration = (current_time - light->timestamp) / (1000U * 60U);
+    light->avg_on_duration = (light->avg_on_duration + duration) / 2;
+    light->light_state = state;
+    light->timestamp = current_time;
+    m_state_rom(light, 'S');
+    return 0;
+  }
+  else if (state == 1)
+  {
+    light->light_state = state;
+    light->timestamp = current_time;
+    return 1;
+  }
+
+  return 255;
 }
 
 int digitalReadDebounce(int pin)
