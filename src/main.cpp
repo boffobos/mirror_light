@@ -350,10 +350,8 @@ int handle_press_button(BUTTON *btn)
 
   if (current_signal != last_signal)
   {
-    Serial.println("Level changed");
     if (current_signal == HIGH)
     {
-      Serial.println("To HIGHT");
       if (front == 0)
       {
         state = -1;
@@ -368,7 +366,6 @@ int handle_press_button(BUTTON *btn)
     }
     else
     {
-      Serial.println("To LOW");
       if (front == 0)
       {
         state = 1;
@@ -500,13 +497,25 @@ uint8_t dec_to_bin_arr(uint8_t number, uint8_t *arr, uint8_t arr_size)
 
 void handle_switching_light(M_STATE *id)
 {
-  uint32_t current_time = millis();
-  uint32_t timeout_ms = INITIAL_TIMEOUT * 1000 * 60;
-  uint8_t arr[relays_count];
-  // handling timeout
-  if (current_time - id->timestamp > timeout_ms)
+  struct light_state
   {
-    id->light_state = 0;
+    uint8_t prev_light_state : 1;
+    uint8_t is_timeout : 1;
+    uint8_t timeout_delay : 4;       // additional time for average duration of light in on state to produce appropriate timeout time
+    uint8_t short_timeout_delta : 2; // if light turn on after timeout during this period of time then increase timeout_delay
+  };
+  uint32_t current_time = millis();
+  static uint32_t timeout_timestamp = 0;
+  static struct light_state conf = {0, 0, 5, 1};
+  uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
+  uint8_t arr[relays_count];
+
+  // handling timeout
+  if (current_time - id->timestamp > timeout_ms && id->light_state == 1 && id->avg_on_duration != 0)
+  {
+    toggle_light(id, 0);
+    conf.is_timeout = 1;
+    timeout_timestamp = current_time;
   }
 
   if (id->light_state == 0)
@@ -514,16 +523,32 @@ void handle_switching_light(M_STATE *id)
     uint8_t result = dec_to_bin_arr(0, arr, relays_count);
     if (result)
       handle_relays_switching(relays, arr);
-
-    return;
   }
   else if (id->light_state == 1)
   {
+
     uint8_t result = dec_to_bin_arr(id->light_mode, arr, relays_count);
     if (result)
       handle_relays_switching(relays, arr);
-    return;
+
+    if (conf.is_timeout)
+    {
+      uint32_t t = (uint32_t)conf.short_timeout_delta * 60U * 1000U;
+      if (current_time - timeout_timestamp < t)
+      {
+        if (conf.timeout_delay < 15)
+          conf.timeout_delay += 1;
+        conf.is_timeout = 0;
+      }
+      else
+      {
+        if (conf.timeout_delay > 0)
+          conf.timeout_delay -= 1;
+        conf.is_timeout = 0;
+      }
+    }
   }
+  conf.prev_light_state = id->light_state;
 
   return;
 }
@@ -563,6 +588,7 @@ int toggle_light(M_STATE *light, uint8_t state)
     light->light_state = state;
     light->timestamp = current_time;
     m_state_rom(light, 'S');
+
     return 0;
   }
   else if (state == 1)
@@ -595,12 +621,14 @@ int digitalReadDebounce(int pin)
 uint8_t m_state_rom(M_STATE *id, char action)
 {
   // Need to verify saving and loaded data
-  int address_offset_state = 0;
-  int address_offset_mode = address_offset_state + sizeof(id->light_state);
+  int address_offset_duration = 0;
+  int address_offset_mode = address_offset_duration + sizeof(id->light_state);
   uint8_t max_mode = power(2, relays_count) - 1;
   if (action == 'S')
   {
     if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
+      return 0;
+    if (id->avg_on_duration != EEPROM.put(address_offset_duration, id->avg_on_duration))
       return 0;
 
     return 1;
@@ -611,6 +639,7 @@ uint8_t m_state_rom(M_STATE *id, char action)
     // EEPROM.get(address_offset_state, id->light_state);
     id->light_state = 0; // set light off when boot
     EEPROM.get(address_offset_mode, id->light_mode);
+    EEPROM.get(address_offset_duration, id->avg_on_duration);
     if (id->light_mode < 1 || id->light_mode > max_mode)
       id->light_mode = max_mode;
 
