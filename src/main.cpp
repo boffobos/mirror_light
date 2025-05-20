@@ -1,9 +1,6 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
-// // debuger lib
-// #include "avr8-stub.h"
-// #include "app_api.h"
 
 // Todo:
 // + Timeout when light should turn off automaticaly
@@ -22,12 +19,12 @@
   }
 */
 // + Relay struct and managing independent on relay type (high or low signal triggered) by sending array 1 and 0 [1,0] [1,1] [0,1] [0,0] etc.
-// Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
-// At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
-// If button type M when timeout happens may should reset button state to 0
-// Momentary button may should't have defined state. It should emits only changing signal levels.
-// Posibility to remove devices
+// + Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
+// + If button type M when timeout happens may should reset button state to 0
+// + Momentary button may should't have defined state. It should emits only changing signal levels.
+// Posibility to remove devices or reinitialize if device exists
 // Additional to define new devices need to receive JSON with commands, that could change eg. light_state, light_mode, timeout etc.
+// At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
 ////////////////////////////////////////
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
@@ -51,13 +48,12 @@
 
 struct M_STATE
 {
-  // Light can be turned on or off (1 or 0 respectively)
-  uint8_t light_state;
-  // Light mode can be cold white, warm white and mixed lamp turned on (1, 2, 3 respectively - like a byte [10000000], [01000000], [11000000])
-  uint8_t light_mode;
-  uint32_t timestamp;
-  uint8_t max_light_mode;
-  uint8_t avg_on_duration;
+  uint8_t light_state;      // Light can be turned on or off (1 or 0 respectively)
+  uint8_t light_mode;       // Light mode can be cold white, warm white and mixed lamp turned on (1, 2, 3 respectively - like a byte [10000000], [01000000], [11000000])
+  uint32_t timestamp;       // last system time light_mode has been changed
+  uint8_t max_light_mode;   // depends on
+  uint8_t avg_on_duration;  // part of timeout duration - avg_on_duration + delta = timeout
+  uint8_t timeout_cooldown; // period of time in seconds after timeout is griggered it is possible to turn device on to increase timeout delay else it is derceased
 };
 
 struct BUTTON
@@ -181,6 +177,7 @@ void setup()
   else
   {
     light.max_light_mode = power(2, relays_count) - 1;
+    light.timeout_cooldown = 60;
   }
 }
 
@@ -500,13 +497,12 @@ void handle_switching_light(M_STATE *id)
   struct light_state
   {
     uint8_t prev_light_state : 1;
-    uint8_t is_timeout : 1;
-    uint8_t timeout_delay : 4;       // additional time for average duration of light in on state to produce appropriate timeout time
-    uint8_t short_timeout_delta : 2; // if light turn on after timeout during this period of time then increase timeout_delay
+    uint8_t is_timeout : 1;   // if state was changed by timeout
+    int8_t timeout_delay : 6; // additional time in minutes for id->average_on_duration to produce appropriate timeout time
   };
   uint32_t current_time = millis();
   static uint32_t timeout_timestamp = 0;
-  static struct light_state conf = {0, 0, 5, 1};
+  static struct light_state conf = {0, 0, 0};
   uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
   uint8_t arr[relays_count];
 
@@ -533,16 +529,16 @@ void handle_switching_light(M_STATE *id)
 
     if (conf.is_timeout)
     {
-      uint32_t t = (uint32_t)conf.short_timeout_delta * 60U * 1000U;
+      uint32_t t = (uint32_t)id->timeout_cooldown * 1000U;
       if (current_time - timeout_timestamp < t)
       {
-        if (conf.timeout_delay < 15)
+        if (conf.timeout_delay < 31)
           conf.timeout_delay += 1;
         conf.is_timeout = 0;
       }
       else
       {
-        if (conf.timeout_delay > 0)
+        if (conf.timeout_delay > -31)
           conf.timeout_delay -= 1;
         conf.is_timeout = 0;
       }
@@ -571,6 +567,9 @@ void change_light_mode(M_STATE *light)
 int toggle_light(M_STATE *light, uint8_t state)
 {
   uint32_t current_time = millis();
+  const uint8_t iterations = 20;
+  static uint8_t durations[iterations];
+  static uint8_t index = 0;
 
   if (light->avg_on_duration == 0 && light->timestamp != 0)
   {
@@ -583,8 +582,19 @@ int toggle_light(M_STATE *light, uint8_t state)
 
   if (state == 0)
   {
+    // after every 20th turn off it is calculated average duration device has been in ON state last 20 turns on. This average partialy defines timeout
     uint8_t duration = (current_time - light->timestamp) / (1000U * 60U);
-    light->avg_on_duration = (light->avg_on_duration + duration) / 2;
+    durations[index] = duration;
+    index++;
+    if (index >= iterations)
+    {
+      uint16_t summ = 0;
+      for (int i = 0; i < iterations; i++)
+        summ += durations[i];
+      light->avg_on_duration = (uint8_t)((uint16_t)(light->avg_on_duration + summ) / (uint16_t)(iterations + 1));
+      index = 0;
+    }
+
     light->light_state = state;
     light->timestamp = current_time;
     m_state_rom(light, 'S');
