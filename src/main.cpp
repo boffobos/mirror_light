@@ -22,9 +22,19 @@
 // + Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
 // + If button type M when timeout happens may should reset button state to 0
 // + Momentary button may should't have defined state. It should emits only changing signal levels.
+// {
 // Posibility to remove devices or reinitialize if device exists
 // Additional to define new devices need to receive JSON with commands, that could change eg. light_state, light_mode, timeout etc.
+// }
 // At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
+/* extended JSON for commands and other options
+  {
+    "class": "D" | "C",                    // "D" - for device adding, "C" - for command
+    ["action":"command"],                  // optional command text
+    ["options": [1, 2, 3, "a", "b", "c"]], // optional additional options for command
+    ["device": { }],                       // optional object with device configuration described above
+  }
+*/
 ////////////////////////////////////////
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
@@ -41,7 +51,7 @@
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
 #define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
 #define DEBUGING 0       // Switch some serial ouput for debuging purpose
-#define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
+#define CLEAN_ROM 1      // Erase EEPRON during setup(). For debuging
 #define DOUBLE_CLICK_TIME 500
 
 // Type and struct definitions:
@@ -114,6 +124,7 @@ uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
 int pin_to_int(const char *pin);
 int power(int x, int y);
+void handle_input_commands(char *input);
 
 void setup()
 {
@@ -218,65 +229,8 @@ void loop()
   uint8_t new_data = read_input(input_buffer, JSON_BUFFER);
   if (new_data)
   {
-    PERIPHERALS new_devices = handle_input(input_buffer);
-    Serial.println("New device: ");
-    Serial.print(F("is_button: "));
-    Serial.println(new_devices.is_button);
-    Serial.print(F("is_relay: "));
-    Serial.println(new_devices.is_relay);
-    if (new_devices.is_button)
-    {
-      // Check if provided pin not already used if it is re-define that button
-      // If it new button and pin not used check if array of buttons not full
-      define_new_button(new_devices.button);
-      if (new_devices.button->is_defined)
-      {
-        int saved = button_rom(new_devices.button, buttons_count, 'S');
-        if (saved)
-        {
-          buttons[buttons_count] = *new_devices.button;
-          Serial.println("Button saved to ROM");
-        }
-        else
-        {
-          Serial.println("Button saving failed");
-        }
-        // debug purpose
-        if (DEBUGING)
-        {
-          Serial.print(F(" Buttons count: "));
-          Serial.println(buttons_count);
-          Serial.print(F("New button pin: "));
-          Serial.println(buttons[buttons_count].pin);
-          Serial.print(F("New button def: "));
-          Serial.println(buttons[buttons_count].is_defined);
-          Serial.print(F("New button type: "));
-          Serial.println(buttons[buttons_count].type);
-          Serial.print(F("New button front: "));
-          Serial.println(buttons[buttons_count].front);
-        }
-        //
-        buttons_count = buttons_count + 1;
-        free(new_devices.button);
-      }
-    }
-    else if (new_devices.is_relay)
-    {
-      if (relays_count < MAX_RELAYS)
-      {
-        relays[relays_count] = *new_devices.relay;
-        int is_saved = relay_rom(&relays[relays_count], relays_count, 'S');
-        if (is_saved)
-          Serial.println("Relay saved to ROM");
-
-        pinMode(relays[relays_count].pin, OUTPUT);
-        relays_count++;
-      }
-      free(new_devices.relay);
-    }
-    // Serial.println("Finishing device definition");
-    // Serial.println(input_buffer);
-    // Serial.println(pin);
+    handle_input_commands(input_buffer);
+    new_data = 0;
   }
 }
 // put function definitions here:
@@ -817,8 +771,6 @@ PERIPHERALS handle_input(char *input)
   JsonDocument json;
   uint8_t invalid_param = 127;
   // need to handle case when array reaches maximum buttons
-  // BUTTON *btn = &buttons[buttons_count]; // get not accupied array member with buttons
-  // RELAY *relay = &relays[relays_count]; // get not occupied array member with relays
 
   DeserializationError error = deserializeJson(json, input);
 
@@ -832,10 +784,12 @@ PERIPHERALS handle_input(char *input)
   }
 
   int pin = pin_to_int(json["pin"].as<const char *>());
-  pin = pin <= 0 ? json["pin"] : pin; // It need cause json["pin"].as<const char *> can't convert number from json to string
+  pin = pin <= 0 ? json["pin"] : pin; // It need cause json["pin"].as<const char *> can't convert number (without quotes) from json to string
+  // Serial.print("Inside handle_input() pin: ");
+  // Serial.println(pin);
   const char *device_type = json["device"];
 
-  if (device_type[0] == 'B')
+  if (device_type[0] == 'B') // May use strcmp() instead
   {
     BUTTON *btn = (BUTTON *)malloc(sizeof(BUTTON));
     if (!btn)
@@ -905,12 +859,13 @@ PERIPHERALS handle_input(char *input)
 int pin_to_int(const char *pin)
 {
   // Function convert analog pin number in string form from input to digital pin number
-  // e.g. A0 -> 14, A1 -> 15, A2 -> 16, A3 -> 17, A4 -> 18, A5 -> 19
-  Serial.print("Inside pin_to_int pin: ");
-  Serial.println(pin);
+  // e.g. A0 -> 14, A1 -> 15, A2 -> 16, A3 -> 17, A4 -> 18, A5 -> 19 for arduino nano boards
+  // Serial.print("Inside pin_to_int pin: ");
+  // Serial.println(*pin);
   if (pin[0] == 'A')
   {
     int pin_number = atoi(pin + 1);
+    Serial.println(pin_number);
     if (pin_number + 14 >= A0 && pin_number + 14 <= A7)
     {
       return pin_number + 14;
@@ -945,4 +900,103 @@ int power(int x, int y)
     res *= x;
 
   return res;
+}
+
+void handle_input_commands(char *input)
+{
+  const uint8_t device_max_chars = 64;
+  JsonDocument json;
+  DeserializationError err = deserializeJson(json, input);
+
+  if (err)
+    return;
+
+  uint8_t is_pin = json["pin"].is<JsonVariant>();
+
+  if (!json["class"].is<JsonVariant>() && !is_pin)
+    return;
+
+  if (strcmp(json["class"], "D") == 0 || is_pin) // hande new and old style json in the same time
+  {
+    if (!json["device"].is<JsonVariant>() && !is_pin)
+      return;
+
+    char device[device_max_chars];
+    if (is_pin)
+      serializeJson(json.as<JsonObject>(), device);
+    else
+      serializeJson(json["device"].as<JsonObject>(), device);
+
+    Serial.println(device);
+
+    PERIPHERALS new_dev = handle_input(device);
+    if (new_dev.is_button || new_dev.is_relay)
+    {
+      Serial.print(F("New device - "));
+      if (new_dev.is_button)
+        Serial.println(F("button"));
+      else if (new_dev.is_relay)
+        Serial.println(F("relay"));
+    }
+    else
+    {
+      Serial.println("No new device received. Check sent data!");
+    }
+
+    if (new_dev.is_button)
+    {
+      // Check if provided pin not already used if it is re-define that button
+      // If it new button and pin not used check if array of buttons not full
+      define_new_button(new_dev.button);
+      if (new_dev.button->is_defined)
+      {
+        // should check if there is button on this pin and rewrite this button is buttons array
+        int saved = button_rom(new_dev.button, buttons_count, 'S');
+        if (saved)
+        {
+          buttons[buttons_count] = *new_dev.button;
+          Serial.println(F("Button saved to ROM"));
+        }
+        else
+        {
+          Serial.println(F("Button saving failed"));
+        }
+        // debug purpose
+        if (DEBUGING)
+        {
+          Serial.print(F(" Buttons count: "));
+          Serial.println(buttons_count);
+          Serial.print(F("New button pin: "));
+          Serial.println(buttons[buttons_count].pin);
+          Serial.print(F("New button def: "));
+          Serial.println(buttons[buttons_count].is_defined);
+          Serial.print(F("New button type: "));
+          Serial.println(buttons[buttons_count].type);
+          Serial.print(F("New button front: "));
+          Serial.println(buttons[buttons_count].front);
+        }
+        //
+        buttons_count = buttons_count + 1;
+        free(new_dev.button);
+      }
+    }
+    else if (new_dev.is_relay)
+    {
+      if (relays_count < MAX_RELAYS)
+      {
+        relays[relays_count] = *new_dev.relay;
+        int is_saved = relay_rom(&relays[relays_count], relays_count, 'S');
+        if (is_saved)
+          Serial.println("Relay saved to ROM");
+
+        pinMode(relays[relays_count].pin, OUTPUT);
+        relays_count++;
+      }
+      free(new_dev.relay);
+    }
+  }
+  else if (strcmp(json["class"], "C") == 0)
+  {
+    Serial.println("Command");
+  }
 }
