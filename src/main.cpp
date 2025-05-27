@@ -23,8 +23,9 @@
 // + If button type M when timeout happens may should reset button state to 0
 // + Momentary button may should't have defined state. It should emits only changing signal levels.
 // {
-// Posibility to remove devices or reinitialize if device exists
-// Additional to define new devices need to receive JSON with commands, that could change eg. light_state, light_mode, timeout etc.
+// Posibility to remove devices
+// + Posibility to reinitialize if device exists
+// Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc.
 // }
 // At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
 /* extended JSON for commands and other options
@@ -35,6 +36,8 @@
     ["device": { }],                       // optional object with device configuration described above
   }
 */
+// Light should turn on in full mode (every bulb is glowing)
+// Locked button should have posibility to change light state with front and rear edges (not syncronous mode: if timeout happend button should turn on light with self off state)
 ////////////////////////////////////////
 // Improvments:
 // in function define new button need to change periodicaly pinMode to detect pressing button with different front
@@ -42,7 +45,7 @@
 // May should blink with light when button is defined
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
-#define INITIAL_TIMEOUT 20L
+#define MIN_TIMEOUT 5L
 #define MAX_BUTTONS 5
 #define MAX_RELAYS 5
 #define START_BTN_PIN 2  // Define first GPIO in the row for buttons
@@ -51,8 +54,9 @@
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
 #define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
 #define DEBUGING 0       // Switch some serial ouput for debuging purpose
-#define CLEAN_ROM 1      // Erase EEPRON during setup(). For debuging
+#define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
 #define DOUBLE_CLICK_TIME 500
+#define MIN_COUNTABLE_DURATION 1U
 
 // Type and struct definitions:
 
@@ -224,6 +228,21 @@ void loop()
     }
     //
   }
+  // debug purpose
+  if (DEBUGING)
+  {
+    Serial.print(F(" Buttons count: "));
+    Serial.println(buttons_count);
+    Serial.print(F("New button pin: "));
+    Serial.println(buttons[buttons_count].pin);
+    Serial.print(F("New button def: "));
+    Serial.println(buttons[buttons_count].is_defined);
+    Serial.print(F("New button type: "));
+    Serial.println(buttons[buttons_count].type);
+    Serial.print(F("New button front: "));
+    Serial.println(buttons[buttons_count].front);
+  }
+  //
   watching_buttons_state_changes(&light, buttons, buttons_count);
   handle_switching_light(&light);
   uint8_t new_data = read_input(input_buffer, JSON_BUFFER);
@@ -236,17 +255,17 @@ void loop()
 // put function definitions here:
 void define_new_button(BUTTON *btn)
 {
-  // on the first power on this function should recognize button type: e.g. maintained or momentary, high or low level
-  if (btn->pin < START_BTN_PIN || btn->pin > END_BTN_PIN)
-    return;
-
-  pinMode(btn->pin, INPUT_PULLUP);
-
+  // this function get BUTTON with pin only and recognize and set other properties
   unsigned long max_depress_time_ms = 300; // time need to depress and release momentary button
   int current_signal_state = digitalReadDebounce(btn->pin);
   unsigned long current_time = millis();
   unsigned long signal_changed_time = 0;
   int btn_prev_state = current_signal_state;
+
+  if (btn->pin < START_BTN_PIN || btn->pin > END_BTN_PIN)
+    return;
+
+  pinMode(btn->pin, INPUT_PULLUP);
 
   // Debug purpose
   if (DEBUGING)
@@ -460,6 +479,9 @@ void handle_switching_light(M_STATE *id)
   uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
   uint8_t arr[relays_count];
 
+  if (timeout_ms < (uint32_t)MIN_TIMEOUT * 60U * 1000U) // Set min amount of timeout
+    timeout_ms = (uint32_t)MIN_TIMEOUT * 60U * 1000U;
+
   // handling timeout
   if (current_time - id->timestamp > timeout_ms && id->light_state == 1 && id->avg_on_duration != 0)
   {
@@ -538,8 +560,11 @@ int toggle_light(M_STATE *light, uint8_t state)
   {
     // after every 20th turn off it is calculated average duration device has been in ON state last 20 turns on. This average partialy defines timeout
     uint8_t duration = (current_time - light->timestamp) / (1000U * 60U);
-    durations[index] = duration;
-    index++;
+    if (duration > MIN_COUNTABLE_DURATION) // to cut too short test switches
+    {
+      durations[index] = duration;
+      index++;
+    }
     if (index >= iterations)
     {
       uint16_t summ = 0;
@@ -927,8 +952,6 @@ void handle_input_commands(char *input)
     else
       serializeJson(json["device"].as<JsonObject>(), device);
 
-    Serial.println(device);
-
     PERIPHERALS new_dev = handle_input(device);
     if (new_dev.is_button || new_dev.is_relay)
     {
@@ -945,58 +968,105 @@ void handle_input_commands(char *input)
 
     if (new_dev.is_button)
     {
-      // Check if provided pin not already used if it is re-define that button
-      // If it new button and pin not used check if array of buttons not full
+      // !done: Check if provided pin not already used if it is re-define that button
+      // !done: If it is new button and pin not used check if array of buttons not full
       define_new_button(new_dev.button);
-      if (new_dev.button->is_defined)
+      if (new_dev.button->is_defined && buttons_count < MAX_BUTTONS - 1)
       {
-        // should check if there is button on this pin and rewrite this button is buttons array
-        int saved = button_rom(new_dev.button, buttons_count, 'S');
-        if (saved)
+        // !done: should check if there is button on this pin and rewrite this button is buttons array
+        uint8_t ndx = -1;
+        for (int i = 0; i < buttons_count; i++)
         {
-          buttons[buttons_count] = *new_dev.button;
+          if (buttons[i].pin == new_dev.button->pin) // looking for existing button on provided pin
+            ndx = i;
+        }
+        if (ndx < 0 || ndx >= MAX_BUTTONS)
+        {
+          ndx = buttons_count; // If button on provided pin not exists add new button to array
+        }
+
+        int is_saved = button_rom(new_dev.button, ndx, 'S');
+        if (is_saved)
+        {
+          buttons[ndx] = *new_dev.button;
           Serial.println(F("Button saved to ROM"));
         }
         else
         {
           Serial.println(F("Button saving failed"));
         }
-        // debug purpose
-        if (DEBUGING)
-        {
-          Serial.print(F(" Buttons count: "));
-          Serial.println(buttons_count);
-          Serial.print(F("New button pin: "));
-          Serial.println(buttons[buttons_count].pin);
-          Serial.print(F("New button def: "));
-          Serial.println(buttons[buttons_count].is_defined);
-          Serial.print(F("New button type: "));
-          Serial.println(buttons[buttons_count].type);
-          Serial.print(F("New button front: "));
-          Serial.println(buttons[buttons_count].front);
-        }
-        //
-        buttons_count = buttons_count + 1;
-        free(new_dev.button);
+        buttons_count = (ndx == buttons_count) ? (buttons_count + 1) : buttons_count;
       }
+
+      free(new_dev.button);
     }
     else if (new_dev.is_relay)
     {
-      if (relays_count < MAX_RELAYS)
+      if (relays_count < MAX_RELAYS - 1)
       {
-        relays[relays_count] = *new_dev.relay;
-        int is_saved = relay_rom(&relays[relays_count], relays_count, 'S');
+        uint8_t ndx = -1;
+        for (int i = 0; i < relays_count; i++)
+        {
+          if (relays[i].pin == new_dev.relay->pin)
+            ndx = i;
+        }
+        if (ndx < 0 || ndx >= MAX_RELAYS)
+          ndx = relays_count;
+
+        relays[ndx] = *new_dev.relay;
+        int is_saved = relay_rom(&relays[ndx], ndx, 'S');
         if (is_saved)
           Serial.println("Relay saved to ROM");
 
-        pinMode(relays[relays_count].pin, OUTPUT);
-        relays_count++;
+        pinMode(relays[ndx].pin, OUTPUT);
+        relays_count = (ndx == relays_count) ? (relays_count + 1) : relays_count;
+
+        uint8_t max_mode = power(2, relays_count) - 1;
+        light.max_light_mode = max_mode;
+        if (light.light_mode < 1 || light.light_mode > light.max_light_mode)
+          light.light_mode = light.max_light_mode; // when new relay added change max_mode and current light_mode if it is not valid value
       }
+
       free(new_dev.relay);
     }
   }
   else if (strcmp(json["class"], "C") == 0)
   {
-    Serial.println("Command");
+    if (!json["action"].is<JsonVariant>())
+    {
+      Serial.println("Type help for command list");
+      return;
+    }
+    const char *action = json["action"];
+    Serial.print("Command: ");
+    Serial.println(action);
+    if (strcmp(action, "status") == 0)
+    {
+      Serial.print(F("Buttons count: "));
+      Serial.println(buttons_count);
+      Serial.print(F("Relays count: "));
+      Serial.println(relays_count);
+      Serial.print(F("Light state: "));
+      Serial.println(light.light_state);
+      Serial.print(F("Light mode: "));
+      Serial.println(light.light_mode);
+      Serial.print(F("Average duration: "));
+      Serial.println(light.avg_on_duration);
+    }
+    else if (strcmp(action, "buttons") == 0)
+    {
+      if (buttons_count == 0)
+        Serial.println(F("No buttons defined"));
+      for (int i = 0; i < buttons_count; i++)
+      {
+        Serial.print(F("Button "));
+        Serial.print(i);
+        Serial.println(F(" ================"));
+        Serial.print(F("Pin: "));
+        Serial.println(buttons[i].pin);
+        Serial.print(F("Type: "));
+        Serial.println(buttons[i].type);
+      }
+    }
   }
 }
