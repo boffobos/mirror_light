@@ -44,6 +44,13 @@
 // Need to check loaded data for M_STATE from EEPROM
 // May should blink with light when button is defined
 
+/*EEPROM structure:
+                                  | DEV_CNT_OFFSET  |BUTTON_OFFSET                                              |RELAY_OFFSET
+  |1 1 1 1 1 1 1 1|1 1 1 1 1 1 1 1|1 1 1 1 : 1 1 1 1|1 1 1 1 1 1 1 1|1 1 1 1 1 1 1 1|1 1 1 1 1 1 1 1 |  ....    |1 1 1 1 1 1 1 1|1 1 1 1 1 1 1 1| ....     |
+   avg_on_duration   light_mode     devices count    BUTTON->pin     BUTTON->type     BUTTON->front    buttons   RELAY->pin      RELAY->type       relays
+                                   buttons : relays
+*/
+
 #define member_size(type, member) (sizeof(((type *)0)->member))
 #define MIN_TIMEOUT 5L
 #define MAX_BUTTONS 5
@@ -52,11 +59,14 @@
 #define END_BTN_PIN 13   // Define last GPIO in the row for buttons
 #define START_REL_PIN A0 // Define first GPIO in the row for relays
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
-#define JSON_BUFFER 64   // Buffer for incoming strings from Serial or other external sources
+#define JSON_BUFFER 128  // Buffer for incoming strings from Serial or other external sources
 #define DEBUGING 0       // Switch some serial ouput for debuging purpose
 #define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
 #define DOUBLE_CLICK_TIME 500
 #define MIN_COUNTABLE_DURATION 1U
+#define DEV_CNT_OFFSET member_size(M_STATE, avg_on_duration) + member_size(M_STATE, light_state)
+#define BUTTON_OFFSET DEV_CNT_OFFSET + sizeof(DEV_CNT_T)
+#define RELAY_OFFSET BUTTON_OFFSET + (member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front)) * MAX_BUTTONS
 
 // Type and struct definitions:
 
@@ -68,6 +78,12 @@ struct M_STATE
   uint8_t max_light_mode;   // depends on
   uint8_t avg_on_duration;  // part of timeout duration - avg_on_duration + delta = timeout
   uint8_t timeout_cooldown; // period of time in seconds after timeout is griggered it is possible to turn device on to increase timeout delay else it is derceased
+};
+
+struct DEV_CNT_T
+{
+  uint8_t buttons : 4;
+  uint8_t relays : 4;
 };
 
 struct BUTTON
@@ -99,12 +115,11 @@ struct PERIPHERALS
 };
 
 // Global variables:
-
 struct BUTTON buttons[MAX_BUTTONS];
-uint8_t buttons_count = 0;
 
 struct RELAY relays[MAX_RELAYS];
-uint8_t relays_count = 0;
+
+struct DEV_CNT_T count = {0, 0};
 
 M_STATE light; // need to initialize in runtime
 
@@ -126,9 +141,11 @@ int toggle_light(M_STATE *light, uint8_t state);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
 PERIPHERALS handle_input(char *input);
-int pin_to_int(const char *pin);
+uint8_t pin_to_int(const char *pin);
 int power(int x, int y);
 void handle_input_commands(char *input);
+void remove_device(uint8_t pin, const char *device);
+int dev_count_rom(DEV_CNT_T *ctn, char action);
 
 void setup()
 {
@@ -153,7 +170,7 @@ void setup()
       // Serial.println(F("Relay loaded succesfully"));
       pinMode(relays[i].pin, OUTPUT);
       set_relay_state(&relays[i], 0);
-      relays_count++;
+      count.relays++;
     }
     else
     {
@@ -161,7 +178,7 @@ void setup()
     }
   }
   Serial.print(F("Relays count: "));
-  Serial.println(relays_count);
+  Serial.println(count.relays);
 
   Serial.println(F("Loading buttons..."));
   for (int i = 0; i < MAX_BUTTONS; i++)
@@ -170,7 +187,7 @@ void setup()
     if (is_loaded)
     {
       pinMode(buttons[i].pin, INPUT_PULLUP);
-      buttons_count++;
+      count.buttons++;
     }
     else
     {
@@ -178,20 +195,20 @@ void setup()
     }
   }
   Serial.print(F("Buttons count: "));
-  Serial.println(buttons_count);
+  Serial.println(count.buttons);
 
   uint8_t is_loaded = m_state_rom(&light, 'L');
   if (!is_loaded)
   {
     Serial.println(F("Light config failed to load from ROM"));
     light.light_state = 0;
-    light.max_light_mode = power(2, relays_count) - 1;
+    light.max_light_mode = power(2, count.relays) - 1;
     light.light_mode = light.max_light_mode;
     light.avg_on_duration = 0;
   }
   else
   {
-    light.max_light_mode = power(2, relays_count) - 1;
+    light.max_light_mode = power(2, count.relays) - 1;
     light.timeout_cooldown = 60;
   }
 }
@@ -199,7 +216,7 @@ void setup()
 void loop()
 {
   // put your main code here, to run repeatedly:
-  for (int i = 0; i < buttons_count; i++)
+  for (int i = 0; i < count.buttons; i++)
   {
     handle_press_button(&buttons[i]);
     // debug messages
@@ -216,7 +233,7 @@ void loop()
         Serial.print(light.light_state);
         Serial.print(" Light_mode: ");
         Serial.print(light.light_mode);
-        for (int j = 0; j < relays_count; j++)
+        for (int j = 0; j < count.relays; j++)
         {
           Serial.print(" Rel_");
           Serial.print(j);
@@ -232,18 +249,18 @@ void loop()
   if (DEBUGING)
   {
     Serial.print(F(" Buttons count: "));
-    Serial.println(buttons_count);
+    Serial.println(count.buttons);
     Serial.print(F("New button pin: "));
-    Serial.println(buttons[buttons_count].pin);
+    Serial.println(buttons[count.buttons].pin);
     Serial.print(F("New button def: "));
-    Serial.println(buttons[buttons_count].is_defined);
+    Serial.println(buttons[count.buttons].is_defined);
     Serial.print(F("New button type: "));
-    Serial.println(buttons[buttons_count].type);
+    Serial.println(buttons[count.buttons].type);
     Serial.print(F("New button front: "));
-    Serial.println(buttons[buttons_count].front);
+    Serial.println(buttons[count.buttons].front);
   }
   //
-  watching_buttons_state_changes(&light, buttons, buttons_count);
+  watching_buttons_state_changes(&light, buttons, count.buttons);
   handle_switching_light(&light);
   uint8_t new_data = read_input(input_buffer, JSON_BUFFER);
   if (new_data)
@@ -257,15 +274,15 @@ void define_new_button(BUTTON *btn)
 {
   // this function get BUTTON with pin only and recognize and set other properties
   unsigned long max_depress_time_ms = 300; // time need to depress and release momentary button
-  int current_signal_state = digitalReadDebounce(btn->pin);
   unsigned long current_time = millis();
   unsigned long signal_changed_time = 0;
-  int btn_prev_state = current_signal_state;
-
+  
   if (btn->pin < START_BTN_PIN || btn->pin > END_BTN_PIN)
-    return;
-
+  return;
+  
   pinMode(btn->pin, INPUT_PULLUP);
+  int current_signal_state = digitalReadDebounce(btn->pin);
+  int btn_prev_state = current_signal_state;
 
   // Debug purpose
   if (DEBUGING)
@@ -445,7 +462,7 @@ void handle_relays_switching(RELAY relays[], uint8_t control[])
 
   // check if control have valid values (0 or 1)
 
-  for (int i = 0; i < relays_count; i++)
+  for (int i = 0; i < count.relays; i++)
   {
     if (control[i] > 1)
       continue;
@@ -475,9 +492,9 @@ void handle_switching_light(M_STATE *id)
   };
   uint32_t current_time = millis();
   static uint32_t timeout_timestamp = 0;
-  static struct light_state conf = {0, 0, 0};
+  static struct light_state conf = {0, 0, 1};
   uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
-  uint8_t arr[relays_count];
+  uint8_t arr[count.relays];
 
   if (timeout_ms < (uint32_t)MIN_TIMEOUT * 60U * 1000U) // Set min amount of timeout
     timeout_ms = (uint32_t)MIN_TIMEOUT * 60U * 1000U;
@@ -492,30 +509,38 @@ void handle_switching_light(M_STATE *id)
 
   if (id->light_state == 0)
   {
-    uint8_t result = dec_to_bin_arr(0, arr, relays_count);
+    uint8_t result = dec_to_bin_arr(0, arr, count.relays);
     if (result)
       handle_relays_switching(relays, arr);
   }
   else if (id->light_state == 1)
   {
 
-    uint8_t result = dec_to_bin_arr(id->light_mode, arr, relays_count);
+    uint8_t result = dec_to_bin_arr(id->light_mode, arr, count.relays);
     if (result)
       handle_relays_switching(relays, arr);
 
     if (conf.is_timeout)
     {
       uint32_t t = (uint32_t)id->timeout_cooldown * 1000U;
+      int8_t td = conf.timeout_delay;
+      uint8_t abs_td = abs(td);
       if (current_time - timeout_timestamp < t)
       {
-        if (conf.timeout_delay < 31)
-          conf.timeout_delay += 1;
+        int8_t delay = td > 0 ? (td + abs_td) : (td + abs_td / 2);
+
+        delay = delay > 31 ? 31 : delay;
+        delay = delay == -1 ? 1 : delay;
+        conf.timeout_delay = delay;
         conf.is_timeout = 0;
       }
       else
       {
-        if (conf.timeout_delay > -31)
-          conf.timeout_delay -= 1;
+        int8_t delay = td > 0 ? (td - abs_td / 2) : (td - abs_td);
+
+        delay = delay < -31 ? -31 : delay;
+        delay = delay == 1 ? -1 : delay;
+        conf.timeout_delay = delay;
         conf.is_timeout = 0;
       }
     }
@@ -530,8 +555,8 @@ void change_light_mode(M_STATE *light)
 
   uint8_t max_light_mode = light->max_light_mode;
 
-  if (max_light_mode == 0 && relays_count != 0)
-    max_light_mode = power(2, relays_count) - 1;
+  if (max_light_mode == 0 && count.relays != 0)
+    max_light_mode = power(2, count.relays) - 1;
 
   light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
   light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
@@ -543,11 +568,11 @@ void change_light_mode(M_STATE *light)
 int toggle_light(M_STATE *light, uint8_t state)
 {
   uint32_t current_time = millis();
-  const uint8_t iterations = 20;
+  const uint8_t iterations = 10;
   static uint8_t durations[iterations];
   static uint8_t index = 0;
 
-  if (light->avg_on_duration == 0 && light->timestamp != 0)
+  if (light->avg_on_duration == 0 && light->timestamp != 0) // during first light on defining first avg_on_duration
   {
     if (state == 0)
     {
@@ -612,7 +637,7 @@ uint8_t m_state_rom(M_STATE *id, char action)
   // Need to verify saving and loaded data
   int address_offset_duration = 0;
   int address_offset_mode = address_offset_duration + sizeof(id->light_state);
-  uint8_t max_mode = power(2, relays_count) - 1;
+  uint8_t max_mode = power(2, count.relays) - 1;
   if (action == 'S')
   {
     if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
@@ -640,15 +665,14 @@ uint8_t m_state_rom(M_STATE *id, char action)
 int button_rom(BUTTON *btn, uint8_t btn_number, char action)
 {
   // Function save or load button state from EEPROM. action has 2 options: 'S' - save, 'L' - load
-  // memory size occupied by M_STATE properties saved in EEPROM
-  uint8_t m_state_address_offset = member_size(M_STATE, light_state) + member_size(M_STATE, light_mode);
-  // memory size occupied by BUTTON properties saved in EEPROM
-  uint8_t button_address_offset = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
-  // address offset depending of number of button
-  uint8_t pin_offset = m_state_address_offset + button_address_offset * btn_number;
+
+  // memory size occupied by one button in EEPROM
+  uint8_t button_rom_size = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
+  // address offsets depending of button number
+  uint8_t pin_offset = DEV_CNT_OFFSET + button_rom_size * btn_number;
   uint8_t type_offset = pin_offset + member_size(BUTTON, pin);
   uint8_t front_offset = type_offset + member_size(BUTTON, type);
-  if (action == 'S')
+  if (action == 'S') // Save button to EEPROM
   {
     // Serial.println(F("Button saving..."));
     if (!btn->is_defined)
@@ -674,7 +698,7 @@ int button_rom(BUTTON *btn, uint8_t btn_number, char action)
 
     return 1;
   }
-  else if (action == 'L')
+  else if (action == 'L') // Load buttons from EEPROM
   {
     // Serial.println(F("Button loading..."));
     BUTTON backup;
@@ -701,18 +725,23 @@ int button_rom(BUTTON *btn, uint8_t btn_number, char action)
     *btn = backup;
     return 1;
   }
+  else if (action == 'E') // Erase buttom from EEPROM
+  {
+    uint8_t result = 1;
+    result = result && !EEPROM.put(pin_offset, 0);
+    result = result && !EEPROM.put(type_offset, 0);
+    result = result && !EEPROM.put(front_offset, 0);
+    return result;
+  }
   return 0;
 }
 
 int relay_rom(RELAY *relay, uint8_t relay_number, char action) // Function save or load relay data from/to EEPROM
 {
   // Function save or load relay data from/to EEPROM
-  uint8_t m_state_address_offset = member_size(M_STATE, light_state) + member_size(M_STATE, light_mode);
-  // memory size occupied by BUTTON properties saved in EEPROM
-  uint8_t button_address_offset = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
-  // memory size occupied by RELAY properties saved in EEPROM
-  uint8_t relay_address_offset = member_size(RELAY, pin) + member_size(RELAY, type);
-  uint8_t pin_offset = m_state_address_offset + button_address_offset * MAX_BUTTONS + relay_address_offset * relay_number;
+  // memory size occupied by one relya in EEPROM
+  uint8_t relay_rom_size = member_size(RELAY, pin) + member_size(RELAY, type);
+  uint8_t pin_offset = RELAY_OFFSET + relay_rom_size * relay_number;
   uint8_t type_offset = pin_offset + member_size(RELAY, pin);
 
   if (action == 'S')
@@ -744,6 +773,13 @@ int relay_rom(RELAY *relay, uint8_t relay_number, char action) // Function save 
     *relay = temp_rel;
 
     return 1;
+  }
+  else if (action == 'E')
+  {
+    uint8_t result = 1;
+    result = result && !EEPROM.put(pin_offset, 0);
+    result = result && !EEPROM.put(type_offset, 0);
+    return result;
   }
   return 0;
 }
@@ -808,10 +844,19 @@ PERIPHERALS handle_input(char *input)
     return dev;
   }
 
-  int pin = pin_to_int(json["pin"].as<const char *>());
-  pin = pin <= 0 ? json["pin"] : pin; // It need cause json["pin"].as<const char *> can't convert number (without quotes) from json to string
-  // Serial.print("Inside handle_input() pin: ");
-  // Serial.println(pin);
+  const char *char_pin = json["pin"];
+  uint8_t int_pin = json["pin"];
+
+  uint8_t pin;
+  if (char_pin)
+  {
+    pin = pin_to_int(char_pin);
+  }
+  else if (int_pin)
+  {
+    pin = int_pin;
+  }
+
   const char *device_type = json["device"];
 
   if (device_type[0] == 'B') // May use strcmp() instead
@@ -881,16 +926,13 @@ PERIPHERALS handle_input(char *input)
   return dev;
 }
 
-int pin_to_int(const char *pin)
+uint8_t pin_to_int(const char *pin)
 {
   // Function convert analog pin number in string form from input to digital pin number
   // e.g. A0 -> 14, A1 -> 15, A2 -> 16, A3 -> 17, A4 -> 18, A5 -> 19 for arduino nano boards
-  // Serial.print("Inside pin_to_int pin: ");
-  // Serial.println(*pin);
   if (pin[0] == 'A')
   {
     int pin_number = atoi(pin + 1);
-    Serial.println(pin_number);
     if (pin_number + 14 >= A0 && pin_number + 14 <= A7)
     {
       return pin_number + 14;
@@ -914,7 +956,7 @@ int pin_to_int(const char *pin)
     }
   }
   // If pin is not in range return -1
-  return -1;
+  return 255;
 }
 
 int power(int x, int y)
@@ -971,18 +1013,18 @@ void handle_input_commands(char *input)
       // !done: Check if provided pin not already used if it is re-define that button
       // !done: If it is new button and pin not used check if array of buttons not full
       define_new_button(new_dev.button);
-      if (new_dev.button->is_defined && buttons_count < MAX_BUTTONS - 1)
+      if (new_dev.button->is_defined && count.buttons < MAX_BUTTONS - 1)
       {
         // !done: should check if there is button on this pin and rewrite this button is buttons array
         uint8_t ndx = -1;
-        for (int i = 0; i < buttons_count; i++)
+        for (int i = 0; i < count.buttons; i++)
         {
           if (buttons[i].pin == new_dev.button->pin) // looking for existing button on provided pin
             ndx = i;
         }
         if (ndx < 0 || ndx >= MAX_BUTTONS)
         {
-          ndx = buttons_count; // If button on provided pin not exists add new button to array
+          ndx = count.buttons; // If button on provided pin not exists add new button to array
         }
 
         int is_saved = button_rom(new_dev.button, ndx, 'S');
@@ -995,23 +1037,23 @@ void handle_input_commands(char *input)
         {
           Serial.println(F("Button saving failed"));
         }
-        buttons_count = (ndx == buttons_count) ? (buttons_count + 1) : buttons_count;
+        count.buttons = (ndx == count.buttons) ? (count.buttons + 1) : count.buttons;
       }
 
       free(new_dev.button);
     }
     else if (new_dev.is_relay)
     {
-      if (relays_count < MAX_RELAYS - 1)
+      if (count.relays < MAX_RELAYS - 1)
       {
         uint8_t ndx = -1;
-        for (int i = 0; i < relays_count; i++)
+        for (int i = 0; i < count.relays; i++)
         {
           if (relays[i].pin == new_dev.relay->pin)
             ndx = i;
         }
         if (ndx < 0 || ndx >= MAX_RELAYS)
-          ndx = relays_count;
+          ndx = count.relays;
 
         relays[ndx] = *new_dev.relay;
         int is_saved = relay_rom(&relays[ndx], ndx, 'S');
@@ -1019,9 +1061,9 @@ void handle_input_commands(char *input)
           Serial.println("Relay saved to ROM");
 
         pinMode(relays[ndx].pin, OUTPUT);
-        relays_count = (ndx == relays_count) ? (relays_count + 1) : relays_count;
+        count.relays = (ndx == count.relays) ? (count.relays + 1) : count.relays;
 
-        uint8_t max_mode = power(2, relays_count) - 1;
+        uint8_t max_mode = power(2, count.relays) - 1;
         light.max_light_mode = max_mode;
         if (light.light_mode < 1 || light.light_mode > light.max_light_mode)
           light.light_mode = light.max_light_mode; // when new relay added change max_mode and current light_mode if it is not valid value
@@ -1034,7 +1076,7 @@ void handle_input_commands(char *input)
   {
     if (!json["action"].is<JsonVariant>())
     {
-      Serial.println("Type help for command list");
+      Serial.println("Type \"help\" for command list");
       return;
     }
     const char *action = json["action"];
@@ -1043,9 +1085,9 @@ void handle_input_commands(char *input)
     if (strcmp(action, "status") == 0)
     {
       Serial.print(F("Buttons count: "));
-      Serial.println(buttons_count);
+      Serial.println(count.buttons);
       Serial.print(F("Relays count: "));
-      Serial.println(relays_count);
+      Serial.println(count.relays);
       Serial.print(F("Light state: "));
       Serial.println(light.light_state);
       Serial.print(F("Light mode: "));
@@ -1055,9 +1097,10 @@ void handle_input_commands(char *input)
     }
     else if (strcmp(action, "buttons") == 0)
     {
-      if (buttons_count == 0)
-        Serial.println(F("No buttons defined"));
-      for (int i = 0; i < buttons_count; i++)
+      if (count.buttons == 0)
+        Serial.println(F("No buttons have defined yet"));
+
+      for (int i = 0; i < count.buttons; i++)
       {
         Serial.print(F("Button "));
         Serial.print(i);
@@ -1066,7 +1109,122 @@ void handle_input_commands(char *input)
         Serial.println(buttons[i].pin);
         Serial.print(F("Type: "));
         Serial.println(buttons[i].type);
+        Serial.print(F("Front: "));
+        Serial.println(buttons[i].front);
+      }
+    }
+    else if (strcmp(action, "relays") == 0)
+    {
+      if (count.relays == 0)
+        Serial.println(F("No relays have defined yet"));
+
+      for (int i = 0; i < count.relays; i++)
+      {
+        Serial.print(F("Relay "));
+        Serial.print(i);
+        Serial.println(F(" ================"));
+        Serial.print(F("Pin: "));
+        Serial.println(relays[i].pin);
+        Serial.print(F("Type: "));
+        Serial.println(relays[i].type);
+      }
+    }
+    else if (strcmp(action, "remove") == 0)
+    {
+      /* JSON example
+        {
+          "class":"C",
+          "action":"remove",
+          "device":{"pin":11,"device":"R"|"B"}
+        }
+      */
+      // remove device here
+      if (json["device"].is<JsonVariant>())
+      {
+        uint8_t pin;
+        const char *char_pin = json["device"]["pin"];
+        uint8_t int_pin = json["device"]["pin"];
+        if (char_pin)
+        {
+          pin = pin_to_int(char_pin);
+        }
+        else if (int_pin)
+        {
+          pin = int_pin;
+        }
+        const char *device = json["device"]["device"];
+        remove_device(pin, device);
+      }
+      else
+      {
+        Serial.println(F("Define device to remove"));
       }
     }
   }
+}
+
+void remove_device(uint8_t pin, const char *device)
+{
+  int8_t ndx = -1;
+  if (strcmp(device, "B") == 0)
+  {
+    for (int i = 0; i < count.buttons; i++)
+    {
+      if (ndx != -1)
+      {
+        buttons[ndx] = buttons[i];
+        button_rom(&buttons[ndx], ndx, 'S');
+        ndx++;
+      }
+      if (buttons[i].pin == pin)
+        ndx = i;
+    }
+    if (ndx != -1)
+    {
+      count.buttons--;
+      button_rom(&buttons[count.buttons], count.buttons, 'E');
+      pinMode(pin, INPUT);
+    }
+  }
+  else if (strcmp(device, "R") == 0)
+  {
+    for (int i = 0; i < count.relays; i++)
+    {
+      if (ndx != -1)
+      {
+        relays[ndx] = relays[i];
+        relay_rom(&relays[ndx], ndx, 'S');
+        ndx++;
+      }
+      if (relays[i].pin == pin)
+        ndx = i;
+    }
+    if (ndx != -1)
+    {
+      count.relays--;
+      relay_rom(&relays[count.relays], count.relays, 'E');
+      pinMode(pin, INPUT);
+    }
+  }
+  else
+  {
+    Serial.println(F("Device to remove not found"));
+  }
+}
+
+int dev_count_rom(DEV_CNT_T *cnt, char action)
+{
+  uint8_t address = DEV_CNT_OFFSET;
+
+  if (action == 'S')
+  {
+    EEPROM.put(address, *cnt);
+    return 1;
+  }
+  else if (action == 'L')
+  {
+    EEPROM.get(address, *cnt);
+    return 1;
+  }
+  return 0;
 }
