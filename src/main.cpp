@@ -23,11 +23,11 @@
 // + If button type M when timeout happens may should reset button state to 0
 // + Momentary button may should't have defined state. It should emits only changing signal levels.
 // {
-// Posibility to remove devices
+// + Posibility to remove devices
 // + Posibility to reinitialize if device exists
-// Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc.
+// Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc. List of command may to be defined by preprocessor macros
 // }
-// At startup send to serial json exaples and description of work. It helps remember in future how to redefine settings etc.
+// If wrong input command send help to serial with exaples and description of work. It helps remember in future how to redefine settings etc.
 /* extended JSON for commands and other options
   {
     "class": "D" | "C",                    // "D" - for device adding, "C" - for command
@@ -36,6 +36,7 @@
     ["device": { }],                       // optional object with device configuration described above
   }
 */
+// Ksysha tasks:
 // Light should turn on in full mode (every bulb is glowing)
 // Locked button should have posibility to change light state with front and rear edges (not syncronous mode: if timeout happend button should turn on light with self off state)
 ////////////////////////////////////////
@@ -52,7 +53,7 @@
 */
 
 #define member_size(type, member) (sizeof(((type *)0)->member))
-#define MIN_TIMEOUT 5L
+#define MIN_TIMEOUT 5U
 #define MAX_BUTTONS 5
 #define MAX_RELAYS 5
 #define START_BTN_PIN 2  // Define first GPIO in the row for buttons
@@ -61,12 +62,59 @@
 #define END_REL_PIN A7   // Define first GPIO in the row for relays
 #define JSON_BUFFER 128  // Buffer for incoming strings from Serial or other external sources
 #define DEBUGING 0       // Switch some serial ouput for debuging purpose
-#define CLEAN_ROM 0      // Erase EEPRON during setup(). For debuging
+#define CLEAN_ROM 0      // Erase EEPROM during setup(). For debuging
 #define DOUBLE_CLICK_TIME 500
-#define MIN_COUNTABLE_DURATION 1U
+#define MIN_COUNTABLE_DURATION 1U // Minimun amount of time when light_state was in on state than will be taken to calculate average duration
+#define AVG_DURATION_ITERATION 4U
 #define DEV_CNT_OFFSET member_size(M_STATE, avg_on_duration) + member_size(M_STATE, light_state)
 #define BUTTON_OFFSET DEV_CNT_OFFSET + sizeof(DEV_CNT_T)
 #define RELAY_OFFSET BUTTON_OFFSET + (member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front)) * MAX_BUTTONS
+
+/* List of commands could receive from Serial and handle with handle_input_commands*/
+
+#define STATUS "status"
+#define STATUS_FORMAT "\
+Buttons count: %d\n\
+Relays count: %d\n\
+Light state: %d\n\
+Light mode: %d\n\
+Average duration: %d\n\
+Timeout: %d"
+#define STATUS_FORMAT_LEN 128
+
+#define BUTTONS "buttons"
+#define BUTTONS_FORMAT "\
+Button %d ==================\n\
+Pin: %d\n\
+Type: %c\n\
+Front: %d"
+#define BUTTONS_FORMAT_LEN 128
+#define ERR_BUTTONS_NO_BUTTONS "No button's defined yet"
+
+#define RELAYS "relays"
+#define RELAYS_FORMAT "\
+Relay %d ==================\n\
+Pin: %d\n\
+Type: %c"
+#define RELAYS_FORMAT_LEN 64
+#define ERR_RELAYS_NO_RELAYS "No relay's defined yet"
+
+#define REMOVE "remove"
+#define ERR_REMOVE_NOT_DEFINED "Device to remove not defined"
+
+#define SET_LIGHT_STATE "light_state"
+#define ERR_SET_LIGHT_STATE_NO_OPTIONS "No light state option's defined"
+
+#define SET_LIGHT_MODE "light_mode"
+#define ERR_SET_LIGHT_MODE_NO_OPTIONS "No light mode option's defined"
+#define ERR_SET_LIGHT_MODE_UNSUCCESS "Set light mode failed"
+
+#define SET_AVG_DURATION "set_timeout"
+#define MAX_AVG_DURATION 220U
+#define ERR_SET_AVG_DURATION_NO_OPTIONS "No timeout option's defined"
+#define ERR_SET_AVG_DURATION_OPTION_NOT_IN_RANGE "Provided timeout option's out of range"
+
+/* end list of Serial commands*/
 
 // Type and struct definitions:
 
@@ -78,8 +126,10 @@ struct M_STATE
   uint8_t max_light_mode;   // depends on
   uint8_t avg_on_duration;  // part of timeout duration - avg_on_duration + delta = timeout
   uint8_t timeout_cooldown; // period of time in seconds after timeout is griggered it is possible to turn device on to increase timeout delay else it is derceased
+  uint8_t timeout;
 };
 
+// this struct store actual buttons and relays quantity
 struct DEV_CNT_T
 {
   uint8_t buttons : 4;
@@ -136,7 +186,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
 uint8_t set_relay_state(RELAY *relay, uint8_t to_state);
 void handle_relays_switching(RELAY relays[], uint8_t control[]);
 uint8_t dec_to_bin_arr(uint8_t number, uint8_t *arr, uint8_t arr_size);
-void change_light_mode(M_STATE *light);
+uint8_t change_light_mode(M_STATE *light, int8_t to_mode);
 int toggle_light(M_STATE *light, uint8_t state);
 void handle_switching_light(M_STATE *id);
 uint8_t read_input(char *buf, int len);
@@ -205,6 +255,7 @@ void setup()
     light.max_light_mode = power(2, count.relays) - 1;
     light.light_mode = light.max_light_mode;
     light.avg_on_duration = 0;
+    light.timeout = MIN_TIMEOUT;
   }
   else
   {
@@ -276,10 +327,10 @@ void define_new_button(BUTTON *btn)
   unsigned long max_depress_time_ms = 300; // time need to depress and release momentary button
   unsigned long current_time = millis();
   unsigned long signal_changed_time = 0;
-  
+
   if (btn->pin < START_BTN_PIN || btn->pin > END_BTN_PIN)
-  return;
-  
+    return;
+
   pinMode(btn->pin, INPUT_PULLUP);
   int current_signal_state = digitalReadDebounce(btn->pin);
   int btn_prev_state = current_signal_state;
@@ -400,7 +451,7 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
       {
         is_double_click_waiting = 0;
         timestamp = 0;
-        change_light_mode(light);
+        change_light_mode(light, -1);
 
         // when light_mode changed during light is turned off need to light turn on
         if (light->light_state == 0)
@@ -489,22 +540,29 @@ void handle_switching_light(M_STATE *id)
     uint8_t prev_light_state : 1;
     uint8_t is_timeout : 1;   // if state was changed by timeout
     int8_t timeout_delay : 6; // additional time in minutes for id->average_on_duration to produce appropriate timeout time
+    uint32_t timeout_timestamp : 32;
   };
   uint32_t current_time = millis();
-  static uint32_t timeout_timestamp = 0;
-  static struct light_state conf = {0, 0, 1};
+  static struct light_state conf = {0, 0, 1, 0};
   uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
   uint8_t arr[count.relays];
 
   if (timeout_ms < (uint32_t)MIN_TIMEOUT * 60U * 1000U) // Set min amount of timeout
-    timeout_ms = (uint32_t)MIN_TIMEOUT * 60U * 1000U;
+  {
+    timeout_ms = (uint32_t)((MIN_TIMEOUT + conf.timeout_delay) * 60U * 1000U);
+    id->timeout = (uint8_t)(timeout_ms / (uint32_t)(1000U * 60U));
+  }
+  else
+  {
+    id->timeout = (uint8_t)(timeout_ms / (uint32_t)(1000U * 60U));
+  }
 
   // handling timeout
   if (current_time - id->timestamp > timeout_ms && id->light_state == 1 && id->avg_on_duration != 0)
   {
     toggle_light(id, 0);
     conf.is_timeout = 1;
-    timeout_timestamp = current_time;
+    conf.timeout_timestamp = current_time;
   }
 
   if (id->light_state == 0)
@@ -525,7 +583,7 @@ void handle_switching_light(M_STATE *id)
       uint32_t t = (uint32_t)id->timeout_cooldown * 1000U;
       int8_t td = conf.timeout_delay;
       uint8_t abs_td = abs(td);
-      if (current_time - timeout_timestamp < t)
+      if (current_time - conf.timeout_timestamp < t)
       {
         int8_t delay = td > 0 ? (td + abs_td) : (td + abs_td / 2);
 
@@ -550,7 +608,7 @@ void handle_switching_light(M_STATE *id)
   return;
 }
 
-void change_light_mode(M_STATE *light)
+uint8_t change_light_mode(M_STATE *light, int8_t to_mode)
 {
 
   uint8_t max_light_mode = light->max_light_mode;
@@ -558,18 +616,32 @@ void change_light_mode(M_STATE *light)
   if (max_light_mode == 0 && count.relays != 0)
     max_light_mode = power(2, count.relays) - 1;
 
-  light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
-  light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
-  m_state_rom(light, 'S');
+  if (to_mode > 0 && to_mode <= max_light_mode)
+  {
+    light->light_mode = to_mode;
+    m_state_rom(light, 'S');
+    return 1;
+  }
+  else if (to_mode == -1)
+  {
+    light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
+    m_state_rom(light, 'S');
+    return 1;
+  }
+  else
+  {
+    light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
+    m_state_rom(light, 'S');
+    return 0;
+  }
 
-  return;
+  return 0;
 }
 
 int toggle_light(M_STATE *light, uint8_t state)
 {
   uint32_t current_time = millis();
-  const uint8_t iterations = 10;
-  static uint8_t durations[iterations];
+  static uint8_t durations[AVG_DURATION_ITERATION];
   static uint8_t index = 0;
 
   if (light->avg_on_duration == 0 && light->timestamp != 0) // during first light on defining first avg_on_duration
@@ -590,12 +662,12 @@ int toggle_light(M_STATE *light, uint8_t state)
       durations[index] = duration;
       index++;
     }
-    if (index >= iterations)
+    if (index >= AVG_DURATION_ITERATION)
     {
       uint16_t summ = 0;
-      for (int i = 0; i < iterations; i++)
+      for (uint8_t i = 0; i < AVG_DURATION_ITERATION; i++)
         summ += durations[i];
-      light->avg_on_duration = (uint8_t)((uint16_t)(light->avg_on_duration + summ) / (uint16_t)(iterations + 1));
+      light->avg_on_duration = (uint8_t)((uint16_t)(light->avg_on_duration + summ) / (uint16_t)(AVG_DURATION_ITERATION + 1));
       index = 0;
     }
 
@@ -983,7 +1055,7 @@ void handle_input_commands(char *input)
   if (!json["class"].is<JsonVariant>() && !is_pin)
     return;
 
-  if (strcmp(json["class"], "D") == 0 || is_pin) // hande new and old style json in the same time
+  if (strcmp(json["class"], "D") == 0 || is_pin) // incoming devices. Handling new and old style json in the same time
   {
     if (!json["device"].is<JsonVariant>() && !is_pin)
       return;
@@ -1072,64 +1144,51 @@ void handle_input_commands(char *input)
       free(new_dev.relay);
     }
   }
+  /*=================This block handling incoming commands =================*/
   else if (strcmp(json["class"], "C") == 0)
   {
     if (!json["action"].is<JsonVariant>())
     {
-      Serial.println("Type \"help\" for command list");
+      Serial.println("Type \"help\" for command list"); // placeholder
       return;
     }
     const char *action = json["action"];
-    Serial.print("Command: ");
-    Serial.println(action);
-    if (strcmp(action, "status") == 0)
+
+    // Debug
+    // Serial.print("Command: ");
+    // Serial.println(action);
+
+    if (strcmp(action, STATUS) == 0)
     {
-      Serial.print(F("Buttons count: "));
-      Serial.println(count.buttons);
-      Serial.print(F("Relays count: "));
-      Serial.println(count.relays);
-      Serial.print(F("Light state: "));
-      Serial.println(light.light_state);
-      Serial.print(F("Light mode: "));
-      Serial.println(light.light_mode);
-      Serial.print(F("Average duration: "));
-      Serial.println(light.avg_on_duration);
+      char status[STATUS_FORMAT_LEN];
+      sprintf(status, STATUS_FORMAT, count.buttons, count.relays, light.light_state, light.light_mode, light.avg_on_duration, light.timeout);
+      Serial.println(status);
     }
-    else if (strcmp(action, "buttons") == 0)
+    else if (strcmp(action, BUTTONS) == 0)
     {
       if (count.buttons == 0)
-        Serial.println(F("No buttons have defined yet"));
+        Serial.println(F(ERR_BUTTONS_NO_BUTTONS));
 
       for (int i = 0; i < count.buttons; i++)
       {
-        Serial.print(F("Button "));
-        Serial.print(i);
-        Serial.println(F(" ================"));
-        Serial.print(F("Pin: "));
-        Serial.println(buttons[i].pin);
-        Serial.print(F("Type: "));
-        Serial.println(buttons[i].type);
-        Serial.print(F("Front: "));
-        Serial.println(buttons[i].front);
+        char button_print[BUTTONS_FORMAT_LEN];
+        sprintf(button_print, BUTTONS_FORMAT, i, buttons[i].pin, buttons[i].type, buttons[i].front);
+        Serial.println(button_print);
       }
     }
-    else if (strcmp(action, "relays") == 0)
+    else if (strcmp(action, RELAYS) == 0)
     {
       if (count.relays == 0)
-        Serial.println(F("No relays have defined yet"));
+        Serial.println(F(ERR_RELAYS_NO_RELAYS));
 
       for (int i = 0; i < count.relays; i++)
       {
-        Serial.print(F("Relay "));
-        Serial.print(i);
-        Serial.println(F(" ================"));
-        Serial.print(F("Pin: "));
-        Serial.println(relays[i].pin);
-        Serial.print(F("Type: "));
-        Serial.println(relays[i].type);
+        char relay_print[RELAYS_FORMAT_LEN];
+        sprintf(relay_print, RELAYS_FORMAT, i, relays[i].pin, relays[i].type);
+        Serial.println(relay_print);
       }
     }
-    else if (strcmp(action, "remove") == 0)
+    else if (strcmp(action, REMOVE) == 0)
     {
       /* JSON example
         {
@@ -1139,26 +1198,66 @@ void handle_input_commands(char *input)
         }
       */
       // remove device here
-      if (json["device"].is<JsonVariant>())
+      if (!json["device"].is<JsonVariant>())
       {
-        uint8_t pin;
-        const char *char_pin = json["device"]["pin"];
-        uint8_t int_pin = json["device"]["pin"];
-        if (char_pin)
-        {
-          pin = pin_to_int(char_pin);
-        }
-        else if (int_pin)
-        {
-          pin = int_pin;
-        }
-        const char *device = json["device"]["device"];
-        remove_device(pin, device);
+        Serial.println(F(ERR_REMOVE_NOT_DEFINED));
+        return;
       }
-      else
+
+      uint8_t pin;
+      const char *char_pin = json["device"]["pin"];
+      uint8_t int_pin = json["device"]["pin"];
+      if (char_pin)
       {
-        Serial.println(F("Define device to remove"));
+        pin = pin_to_int(char_pin);
       }
+      else if (int_pin)
+      {
+        pin = int_pin;
+      }
+      const char *device = json["device"]["device"];
+      remove_device(pin, device);
+    }
+    else if (strcmp(action, SET_LIGHT_STATE) == 0)
+    {
+      if (!json["options"].is<JsonVariant>())
+      {
+        Serial.println(F(ERR_SET_LIGHT_STATE_NO_OPTIONS));
+        return;
+      }
+      uint8_t to_state = json["options"][0];
+      // check if state received in valid range
+      toggle_light(&light, to_state);
+    }
+    else if (strcmp(action, SET_LIGHT_MODE) == 0)
+    {
+      // Need to set certain light mode. May need to make function
+      if (!json["options"].is<JsonVariant>())
+      {
+        change_light_mode(&light, -1);
+        return;
+      }
+      uint8_t to_mode = json["options"][0];
+      uint8_t err = 0;
+      if (to_mode > 0 && to_mode <= light.max_light_mode)
+        err = change_light_mode(&light, to_mode);
+      if (!err)
+        Serial.println(F(ERR_SET_LIGHT_MODE_UNSUCCESS));
+    }
+    else if (strcmp(action, SET_AVG_DURATION) == 0)
+    {
+      if (!json["options"].is<JsonVariant>())
+      {
+        Serial.println(F(ERR_SET_AVG_DURATION_NO_OPTIONS));
+        return;
+      }
+      uint8_t duration_m = json["options"][0];
+      if (duration_m < 0 || duration_m > MAX_AVG_DURATION)
+      {
+        Serial.println(F(ERR_SET_AVG_DURATION_OPTION_NOT_IN_RANGE));
+        return;
+      }
+      light.avg_on_duration = duration_m;
     }
   }
 }
