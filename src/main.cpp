@@ -25,7 +25,7 @@
 // {
 // + Posibility to remove devices
 // + Posibility to reinitialize if device exists
-// Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc. List of command may to be defined by preprocessor macros
+// + Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc. List of command may to be defined by preprocessor macros
 // }
 // If wrong input command send help to serial with exaples and description of work. It helps remember in future how to redefine settings etc.
 /* extended JSON for commands and other options
@@ -66,7 +66,8 @@
 #define DOUBLE_CLICK_TIME 500
 #define MIN_COUNTABLE_DURATION 1U // Minimun amount of time when light_state was in on state than will be taken to calculate average duration
 #define AVG_DURATION_ITERATION 4U
-#define DEV_CNT_OFFSET member_size(M_STATE, avg_on_duration) + member_size(M_STATE, light_state)
+#define M_STATE_OFFSET 0
+#define DEV_CNT_OFFSET M_STATE_OFFSET + member_size(M_STATE, avg_on_duration) + member_size(M_STATE, light_state)
 #define BUTTON_OFFSET DEV_CNT_OFFSET + sizeof(DEV_CNT_T)
 #define RELAY_OFFSET BUTTON_OFFSET + (member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front)) * MAX_BUTTONS
 
@@ -208,11 +209,11 @@ void setup()
       EEPROM.put(i, 0);
     }
   }
-  // debug_init();
-  //////////////////
   Serial.begin(9600);
-  Serial.println(F("Loading relays..."));
-  for (int i = 0; i < MAX_RELAYS; i++)
+  dev_count_rom(&count, 'L');
+  uint8_t dev_count = count.relays == 0 ? MAX_RELAYS : count.relays;
+  // Serial.println(F("Loading relays..."));
+  for (int i = 0; i < dev_count; i++)
   {
     uint8_t is_loaded = relay_rom(&relays[i], i, 'L');
     if (is_loaded)
@@ -220,32 +221,34 @@ void setup()
       // Serial.println(F("Relay loaded succesfully"));
       pinMode(relays[i].pin, OUTPUT);
       set_relay_state(&relays[i], 0);
-      count.relays++;
+      count.relays = i + 1;
     }
     else
     {
       // Serial.println(F("Failed to load relay config from ROM"));
     }
   }
-  Serial.print(F("Relays count: "));
-  Serial.println(count.relays);
+  // Serial.print(F("Relays count: "));
+  // Serial.println(count.relays);
 
-  Serial.println(F("Loading buttons..."));
-  for (int i = 0; i < MAX_BUTTONS; i++)
+  // Serial.println(F("Loading buttons..."));
+  dev_count = count.buttons == 0 ? MAX_BUTTONS : count.buttons;
+  for (int i = 0; i < dev_count; i++)
   {
     uint8_t is_loaded = button_rom(&buttons[i], i, 'L');
     if (is_loaded)
     {
       pinMode(buttons[i].pin, INPUT_PULLUP);
-      count.buttons++;
+      count.buttons = i + 1;
     }
     else
     {
       // Serial.println(F("Faled to load button config from ROM"));
     }
   }
-  Serial.print(F("Buttons count: "));
-  Serial.println(count.buttons);
+  dev_count_rom(&count, 'S');
+  // Serial.print(F("Buttons count: "));
+  // Serial.println(count.buttons);
 
   uint8_t is_loaded = m_state_rom(&light, 'L');
   if (!is_loaded)
@@ -255,7 +258,7 @@ void setup()
     light.max_light_mode = power(2, count.relays) - 1;
     light.light_mode = light.max_light_mode;
     light.avg_on_duration = 0;
-    light.timeout = MIN_TIMEOUT;
+    light.timeout_cooldown = 60;
   }
   else
   {
@@ -544,12 +547,13 @@ void handle_switching_light(M_STATE *id)
   };
   uint32_t current_time = millis();
   static struct light_state conf = {0, 0, 1, 0};
-  uint32_t timeout_ms = ((uint32_t)(id->avg_on_duration + conf.timeout_delay)) * 60U * 1000U;
+  uint32_t timeout_ms = (uint32_t)(id->avg_on_duration + conf.timeout_delay) * 60U * 1000U;
   uint8_t arr[count.relays];
 
   if (timeout_ms < (uint32_t)MIN_TIMEOUT * 60U * 1000U) // Set min amount of timeout
   {
     timeout_ms = (uint32_t)((MIN_TIMEOUT + conf.timeout_delay) * 60U * 1000U);
+    timeout_ms = timeout_ms < (uint32_t)(MIN_TIMEOUT * 60U * 1000U) ? (uint32_t)(MIN_TIMEOUT * 60U * 1000U) : timeout_ms;
     id->timeout = (uint8_t)(timeout_ms / (uint32_t)(1000U * 60U));
   }
   else
@@ -707,14 +711,14 @@ int digitalReadDebounce(int pin)
 uint8_t m_state_rom(M_STATE *id, char action)
 {
   // Need to verify saving and loaded data
-  int address_offset_duration = 0;
-  int address_offset_mode = address_offset_duration + sizeof(id->light_state);
+  int address_offset_duration = M_STATE_OFFSET;
+  int address_offset_mode = address_offset_duration + sizeof(id->avg_on_duration);
   uint8_t max_mode = power(2, count.relays) - 1;
   if (action == 'S')
   {
-    if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
-      return 0;
     if (id->avg_on_duration != EEPROM.put(address_offset_duration, id->avg_on_duration))
+      return 0;
+    if (id->light_mode != EEPROM.put(address_offset_mode, id->light_mode))
       return 0;
 
     return 1;
@@ -724,8 +728,8 @@ uint8_t m_state_rom(M_STATE *id, char action)
   {
     // EEPROM.get(address_offset_state, id->light_state);
     id->light_state = 0; // set light off when boot
-    EEPROM.get(address_offset_mode, id->light_mode);
     EEPROM.get(address_offset_duration, id->avg_on_duration);
+    EEPROM.get(address_offset_mode, id->light_mode);
     if (id->light_mode < 1 || id->light_mode > max_mode)
       id->light_mode = max_mode;
 
@@ -741,7 +745,7 @@ int button_rom(BUTTON *btn, uint8_t btn_number, char action)
   // memory size occupied by one button in EEPROM
   uint8_t button_rom_size = member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front);
   // address offsets depending of button number
-  uint8_t pin_offset = DEV_CNT_OFFSET + button_rom_size * btn_number;
+  uint8_t pin_offset = BUTTON_OFFSET + button_rom_size * btn_number;
   uint8_t type_offset = pin_offset + member_size(BUTTON, pin);
   uint8_t front_offset = type_offset + member_size(BUTTON, type);
   if (action == 'S') // Save button to EEPROM
@@ -1110,6 +1114,7 @@ void handle_input_commands(char *input)
           Serial.println(F("Button saving failed"));
         }
         count.buttons = (ndx == count.buttons) ? (count.buttons + 1) : count.buttons;
+        dev_count_rom(&count, 'S');
       }
 
       free(new_dev.button);
@@ -1134,6 +1139,7 @@ void handle_input_commands(char *input)
 
         pinMode(relays[ndx].pin, OUTPUT);
         count.relays = (ndx == count.relays) ? (count.relays + 1) : count.relays;
+        dev_count_rom(&count, 'S');
 
         uint8_t max_mode = power(2, count.relays) - 1;
         light.max_light_mode = max_mode;
