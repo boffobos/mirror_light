@@ -22,12 +22,11 @@
 // + Adaptive timeout (when after timeout event light is turned on in short period of time need to increase timeout, if not - decrease timeout)
 // + If button type M when timeout happens may should reset button state to 0
 // + Momentary button may should't have defined state. It should emits only changing signal levels.
-// {
-// + Posibility to remove devices
-// + Posibility to reinitialize if device exists
-// + Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc. List of command may to be defined by preprocessor macros
-// }
-// If wrong input command send help to serial with exaples and description of work. It helps remember in future how to redefine settings etc.
+/*
+   + Posibility to remove devices
+   + Posibility to reinitialize if device exists
+   + Receiving JSON with commands, that could change eg. light_state, light_mode, timeout etc. List of command may to be defined by preprocessor macros
+*/
 /* extended JSON for commands and other options
   {
     "class": "D" | "C",                    // "D" - for device adding, "C" - for command
@@ -36,12 +35,24 @@
     ["device": { }],                       // optional object with device configuration described above
   }
 */
-// Ksysha tasks:
-// Light should turn on in full mode (every bulb is glowing)
-// Locked button should have posibility to change light state with front and rear edges (not syncronous mode: if timeout happend button should turn on light with self off state)
+// If wrong input command send help to serial with examples and description of work. It helps remember in future how to redefine settings etc.
+/* additional command to add:
+
+  + clean_rom (or reset?)
+
+*/
+
+/* Ksysha tasks:
+  + Light should turn on in full mode (every bulb is glowing)
+  + Locked button should have posibility to change light state with front and rear edges (not syncronous mode: if timeout happend button should turn on light with self off state)
+
+*/
 ////////////////////////////////////////
 // Improvments:
-// in function define new button need to change periodicaly pinMode to detect pressing button with different front
+/* in function define_new_button:
+  if locked button was pressed before definition it defines wrong front
+  need to change periodicaly pinMode to detect pressing button with different front
+*/
 // Need to check loaded data for M_STATE from EEPROM
 // May should blink with light when button is defined
 
@@ -66,7 +77,8 @@
 #define DOUBLE_CLICK_TIME 500
 #define MIN_COUNTABLE_DURATION 1U // Minimun amount of time when light_state was in on state than will be taken to calculate average duration
 #define AVG_DURATION_ITERATION 4U
-#define M_STATE_OFFSET 0
+#define CONFIG_OFFSET 0
+#define M_STATE_OFFSET CONFIG_OFFSET + sizeof(config)
 #define DEV_CNT_OFFSET M_STATE_OFFSET + member_size(M_STATE, avg_on_duration) + member_size(M_STATE, light_state)
 #define BUTTON_OFFSET DEV_CNT_OFFSET + sizeof(DEV_CNT_T)
 #define RELAY_OFFSET BUTTON_OFFSET + (member_size(BUTTON, pin) + member_size(BUTTON, type) + member_size(BUTTON, front)) * MAX_BUTTONS
@@ -115,19 +127,32 @@ Type: %c"
 #define ERR_SET_AVG_DURATION_NO_OPTIONS "No timeout option's defined"
 #define ERR_SET_AVG_DURATION_OPTION_NOT_IN_RANGE "Provided timeout option's out of range"
 
+#define CLEAR_ROM "clear_rom"
+
+#define SET_CONFIG "set_config"
+#define ERR_SET_CONFIG_NO_OPTIONS "No config option's provided"
+
 /* end list of Serial commands*/
 
 // Type and struct definitions:
+
+struct CONFIG
+{
+  uint8_t init_light_state : 2;   // light state after reboot: 00 - off, 01 - on, 11 - last state (this state not implementes)
+  uint8_t default_light_mode : 4; // light mode applyed every time light turned on: 0 - last state, 1 .. n - corresponding mode
+  uint8_t l_button_mode : 1;      // set up locked button behaviour: 0 - default behaveour (when pressed - on, unpressed - off), 1 - front or read edge change state
+};
 
 struct M_STATE
 {
   uint8_t light_state;      // Light can be turned on or off (1 or 0 respectively)
   uint8_t light_mode;       // Light mode can be cold white, warm white and mixed lamp turned on (1, 2, 3 respectively - like a byte [10000000], [01000000], [11000000])
   uint32_t timestamp;       // last system time light_mode has been changed
-  uint8_t max_light_mode;   // depends on
+  uint8_t max_light_mode;   // depends on relay counts
   uint8_t avg_on_duration;  // part of timeout duration - avg_on_duration + delta = timeout
   uint8_t timeout_cooldown; // period of time in seconds after timeout is griggered it is possible to turn device on to increase timeout delay else it is derceased
   uint8_t timeout;
+  uint8_t trigger : 1; // trigger action if light_state or light_mode is changed
 };
 
 // this struct store actual buttons and relays quantity
@@ -166,13 +191,15 @@ struct PERIPHERALS
 };
 
 // Global variables:
+struct CONFIG config = {0, 0, 1};
+
 struct BUTTON buttons[MAX_BUTTONS];
 
 struct RELAY relays[MAX_RELAYS];
 
-struct DEV_CNT_T count = {0, 0};
+struct DEV_CNT_T count;
 
-M_STATE light; // need to initialize in runtime
+struct M_STATE light; // need to initialize in runtime
 
 char input_buffer[JSON_BUFFER];
 
@@ -196,7 +223,9 @@ uint8_t pin_to_int(const char *pin);
 int power(int x, int y);
 void handle_input_commands(char *input);
 void remove_device(uint8_t pin, const char *device);
+int clean_rom(void);
 int dev_count_rom(DEV_CNT_T *ctn, char action);
+int config_rom(CONFIG *cfg, char action);
 
 void setup()
 {
@@ -239,6 +268,7 @@ void setup()
     if (is_loaded)
     {
       pinMode(buttons[i].pin, INPUT_PULLUP);
+      buttons[i].last_pin_state = digitalReadDebounce(buttons[i].pin);
       count.buttons = i + 1;
     }
     else
@@ -254,7 +284,7 @@ void setup()
   if (!is_loaded)
   {
     Serial.println(F("Light config failed to load from ROM"));
-    light.light_state = 0;
+    light.light_state = config.init_light_state;
     light.max_light_mode = power(2, count.relays) - 1;
     light.light_mode = light.max_light_mode;
     light.avg_on_duration = 0;
@@ -262,61 +292,29 @@ void setup()
   }
   else
   {
+    light.light_state = config.init_light_state; //
     light.max_light_mode = power(2, count.relays) - 1;
     light.timeout_cooldown = 60;
+  }
+
+  config_rom(&config, 'L');
+  if (config.default_light_mode > light.max_light_mode)
+  {
+    config.default_light_mode = light.max_light_mode;
   }
 }
 
 void loop()
 {
   // put your main code here, to run repeatedly:
-  for (int i = 0; i < count.buttons; i++)
-  {
-    handle_press_button(&buttons[i]);
-    // debug messages
-    if (DEBUGING)
-    {
 
-      if (millis() % 1000 == 0)
-      {
-        Serial.print("B");
-        Serial.print(i);
-        Serial.print(" State: ");
-        Serial.print(buttons[i].state);
-        Serial.print(" Light_state: ");
-        Serial.print(light.light_state);
-        Serial.print(" Light_mode: ");
-        Serial.print(light.light_mode);
-        for (int j = 0; j < count.relays; j++)
-        {
-          Serial.print(" Rel_");
-          Serial.print(j);
-          Serial.print(" ");
-          Serial.print(relays[j].state);
-        }
-        Serial.println();
-      }
-    }
-    //
-  }
-  // debug purpose
-  if (DEBUGING)
-  {
-    Serial.print(F(" Buttons count: "));
-    Serial.println(count.buttons);
-    Serial.print(F("New button pin: "));
-    Serial.println(buttons[count.buttons].pin);
-    Serial.print(F("New button def: "));
-    Serial.println(buttons[count.buttons].is_defined);
-    Serial.print(F("New button type: "));
-    Serial.println(buttons[count.buttons].type);
-    Serial.print(F("New button front: "));
-    Serial.println(buttons[count.buttons].front);
-  }
-  //
+  for (int i = 0; i < count.buttons; i++)
+    handle_press_button(&buttons[i]);
+
   watching_buttons_state_changes(&light, buttons, count.buttons);
   handle_switching_light(&light);
   uint8_t new_data = read_input(input_buffer, JSON_BUFFER);
+
   if (new_data)
   {
     handle_input_commands(input_buffer);
@@ -436,40 +434,58 @@ void watching_buttons_state_changes(M_STATE *light, BUTTON *btns, int btn_count)
   static uint8_t is_double_click_waiting = 0;
   static uint32_t timestamp;
 
+  if (is_double_click_waiting == 1 && current_time - timestamp > DOUBLE_CLICK_TIME)
+  {
+    is_double_click_waiting = 0;
+    timestamp = 0;
+    toggle_light(light, !light->light_state);
+  }
+
   for (int i = 0; i < btn_count; i++)
   {
     int8_t state = btns[i].state;
     int8_t type = btns[i].type;
 
-    if (is_double_click_waiting == 1 && current_time - timestamp > DOUBLE_CLICK_TIME)
-    {
-      is_double_click_waiting = 0;
-      timestamp = 0;
-      toggle_light(light, !light->light_state);
-    }
-
     if (state == 1)
     {
-      if (is_double_click_waiting == 1)
+      if (type == 'M')
       {
-        is_double_click_waiting = 0;
-        timestamp = 0;
-        change_light_mode(light, -1);
+        if (is_double_click_waiting == 1)
+        {
+          is_double_click_waiting = 0;
+          timestamp = 0;
+          change_light_mode(light, -1);
 
-        // when light_mode changed during light is turned off need to light turn on
-        if (light->light_state == 0)
-          toggle_light(light, !light->light_state);
+          // when light_mode changed during light is turned off need to light turn on
+          if (light->light_state == 0)
+            toggle_light(light, !light->light_state);
+        }
+        else
+        {
+          is_double_click_waiting = 1;
+          timestamp = current_time;
+        }
       }
-      else
+      else if (type == 'L') // Locked button can not perform double clicks
       {
-        is_double_click_waiting = 1;
-        timestamp = current_time;
+        if (config.l_button_mode == 0)
+        {
+          if (light->light_state != 1)
+            toggle_light(light, !light->light_state);
+        }
+        else if (config.l_button_mode == 1)
+        {
+          toggle_light(light, !light->light_state);
+        }
       }
     }
     else if (state == -1)
     {
-      if (type == 'L' && light->light_state == 1)
-        toggle_light(light, !light->light_state);
+      if (type == 'L')
+      {
+        if (config.l_button_mode || light->light_state)
+          toggle_light(light, !light->light_state);
+      }
     }
   }
 }
@@ -569,42 +585,52 @@ void handle_switching_light(M_STATE *id)
     conf.timeout_timestamp = current_time;
   }
 
-  if (id->light_state == 0)
+  if (id->trigger)
   {
-    uint8_t result = dec_to_bin_arr(0, arr, count.relays);
-    if (result)
-      handle_relays_switching(relays, arr);
-  }
-  else if (id->light_state == 1)
-  {
-
-    uint8_t result = dec_to_bin_arr(id->light_mode, arr, count.relays);
-    if (result)
-      handle_relays_switching(relays, arr);
-
-    if (conf.is_timeout)
+    if (id->light_state == 0)
     {
-      uint32_t t = (uint32_t)id->timeout_cooldown * 1000U;
-      int8_t td = conf.timeout_delay;
-      uint8_t abs_td = abs(td);
-      if (current_time - conf.timeout_timestamp < t)
-      {
-        int8_t delay = td > 0 ? (td + abs_td) : (td + abs_td / 2);
+      uint8_t result = dec_to_bin_arr(0, arr, count.relays);
+      if (result)
+        handle_relays_switching(relays, arr);
 
-        delay = delay > 31 ? 31 : delay;
-        delay = delay == -1 ? 1 : delay;
-        conf.timeout_delay = delay;
-        conf.is_timeout = 0;
-      }
-      else
-      {
-        int8_t delay = td > 0 ? (td - abs_td / 2) : (td - abs_td);
+      id->trigger = 0;
+    }
+    else if (id->light_state == 1)
+    {
+      uint8_t light_mode = id->light_mode;
+      // implementation to turn on light with config light_mode
+      if (config.default_light_mode != 0 && config.default_light_mode <= id->max_light_mode && conf.prev_light_state != 1)
+        light_mode = config.default_light_mode;
 
-        delay = delay < -31 ? -31 : delay;
-        delay = delay == 1 ? -1 : delay;
-        conf.timeout_delay = delay;
-        conf.is_timeout = 0;
+      uint8_t result = dec_to_bin_arr(light_mode, arr, count.relays);
+      if (result)
+        handle_relays_switching(relays, arr);
+
+      if (conf.is_timeout)
+      {
+        uint32_t t = (uint32_t)id->timeout_cooldown * 1000U;
+        int8_t td = conf.timeout_delay;
+        uint8_t abs_td = abs(td);
+        if (current_time - conf.timeout_timestamp < t)
+        {
+          int8_t delay = td > 0 ? (td + abs_td) : (td + abs_td / 2);
+
+          delay = delay > 31 ? 31 : delay;
+          delay = delay == -1 ? 1 : delay;
+          conf.timeout_delay = delay;
+          conf.is_timeout = 0;
+        }
+        else
+        {
+          int8_t delay = td > 0 ? (td - abs_td / 2) : (td - abs_td);
+
+          delay = delay < -31 ? -31 : delay;
+          delay = delay == 1 ? -1 : delay;
+          conf.timeout_delay = delay;
+          conf.is_timeout = 0;
+        }
       }
+      id->trigger = 0;
     }
   }
   conf.prev_light_state = id->light_state;
@@ -624,18 +650,21 @@ uint8_t change_light_mode(M_STATE *light, int8_t to_mode)
   {
     light->light_mode = to_mode;
     m_state_rom(light, 'S');
+    light->trigger = 1;
     return 1;
   }
   else if (to_mode == -1)
   {
     light->light_mode = light->light_mode > 1 ? light->light_mode - 1 : max_light_mode;
     m_state_rom(light, 'S');
+    light->trigger = 1;
     return 1;
   }
   else
   {
     light->light_mode = light->light_mode > max_light_mode ? max_light_mode : light->light_mode;
     m_state_rom(light, 'S');
+    light->trigger = 1;
     return 0;
   }
 
@@ -659,9 +688,9 @@ int toggle_light(M_STATE *light, uint8_t state)
 
   if (state == 0)
   {
-    // after every 20th turn off it is calculated average duration device has been in ON state last 20 turns on. This average partialy defines timeout
+    // after every ITERATION turn off it is calculated average duration device has been in ON state last ITERATION turns on. This average partialy defines timeout
     uint8_t duration = (current_time - light->timestamp) / (1000U * 60U);
-    if (duration > MIN_COUNTABLE_DURATION) // to cut too short test switches
+    if (duration > MIN_COUNTABLE_DURATION) // to avoiding impact short switches to average duration
     {
       durations[index] = duration;
       index++;
@@ -677,7 +706,7 @@ int toggle_light(M_STATE *light, uint8_t state)
 
     light->light_state = state;
     light->timestamp = current_time;
-    m_state_rom(light, 'S');
+    light->trigger = 1;
 
     return 0;
   }
@@ -685,6 +714,8 @@ int toggle_light(M_STATE *light, uint8_t state)
   {
     light->light_state = state;
     light->timestamp = current_time;
+    light->trigger = 1;
+
     return 1;
   }
 
@@ -727,7 +758,7 @@ uint8_t m_state_rom(M_STATE *id, char action)
   /* Need to check loaded data*/
   {
     // EEPROM.get(address_offset_state, id->light_state);
-    id->light_state = 0; // set light off when boot
+    // id->light_state = 0; // set light off when boot
     EEPROM.get(address_offset_duration, id->avg_on_duration);
     EEPROM.get(address_offset_mode, id->light_mode);
     if (id->light_mode < 1 || id->light_mode > max_mode)
@@ -1265,6 +1296,23 @@ void handle_input_commands(char *input)
       }
       light.avg_on_duration = duration_m;
     }
+    else if (strcmp(action, CLEAR_ROM) == 0)
+    {
+      clean_rom();
+    }
+    else if (strcmp(action, SET_CONFIG) == 0)
+    {
+      if (!json["options"].is<JsonVariant>())
+      {
+        Serial.println(F(ERR_SET_CONFIG_NO_OPTIONS));
+        return;
+      }
+      // should check every options before set
+      config.init_light_state = json["options"][0];
+      config.default_light_mode = json["options"][1];
+      config.l_button_mode = json["options"][2];
+      config_rom(&config, 'S');
+    }
   }
 }
 
@@ -1317,9 +1365,17 @@ void remove_device(uint8_t pin, const char *device)
   }
 }
 
+int clean_rom(void)
+{
+  for (uint16_t i = 0; i < EEPROM.length(); i++)
+    EEPROM.put(i, 0);
+
+  return 1;
+}
+
 int dev_count_rom(DEV_CNT_T *cnt, char action)
 {
-  uint8_t address = DEV_CNT_OFFSET;
+  uint16_t address = DEV_CNT_OFFSET;
 
   if (action == 'S')
   {
@@ -1331,5 +1387,23 @@ int dev_count_rom(DEV_CNT_T *cnt, char action)
     EEPROM.get(address, *cnt);
     return 1;
   }
+  return 0;
+}
+
+int config_rom(CONFIG *cfg, char action)
+{
+  uint16_t address = CONFIG_OFFSET;
+
+  if (action == 'S')
+  {
+    EEPROM.put(address, *cfg);
+    return 1;
+  }
+  else if (action == 'L')
+  {
+    EEPROM.get(address, *cfg);
+    return 1;
+  }
+
   return 0;
 }
